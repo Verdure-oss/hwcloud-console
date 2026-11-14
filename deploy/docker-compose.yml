@@ -25,7 +25,10 @@
 
 services:
   hwcloud:
-    image: ghcr.io/dddmiku/hwcloud-console:latest
+    # 自建 arm64 镜像（GitHub Actions 构建，推到本账号私有包）。
+    # 注意：镜像名必须**全小写** —— Docker 拒绝大写 tag，
+    # 而 GitHub 用户名 Verdure-oss 含大写，这里只能写 verdure-oss。
+    image: ghcr.io/verdure-oss/hwcloud-console:latest
     # 想本地构建时把上面这行注释掉、取消下面三行的注释：
     # build:
     #   context: .

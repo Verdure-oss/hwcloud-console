@@ -32,7 +32,9 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # 用 arm64 原生 runner：目标服务器是 aarch64，交叉编译要过 QEMU，慢且易失败。
+    # 注意：ubuntu-24.04-arm 只在 public 仓库免费（private 仓库要付费）。
+    runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
       packages: write
@@ -47,12 +49,20 @@ jobs:
           go-version: '1.23'
           cache-dependency-path: go/go.sum
 
+      # arm64 runner 不保证预装 node，而下面「Install Playwright driver」
+      # 要 cp "$(which node)" + npm i。显式装一个，版本对齐
+      # third_party/playwright-go/run.go 里的 nodeVersion。
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
       - name: Build Linux binary
         run: |
           cd go
           # CGO_ENABLED=0：纯静态二进制，不依赖目标机 glibc 版本。
           # -trimpath + -s -w：去掉绝对路径和符号表，12MB 左右。
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
             go build -trimpath -ldflags="-s -w" -o ../deploy/assets/hwcloud ./cmd/hwcloud
           ls -lh ../deploy/assets/hwcloud
 
@@ -101,11 +111,11 @@ jobs:
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          # 为什么不用 secrets.GITHUB_TOKEN：
-          #   这个包是 public，仓库默认 token 推不上去，报
-          #   "denied: permission_denied: write_package"。
-          #   public 包的写入必须用显式带 write:packages 的 PAT。
-          password: ${{ secrets.GHCR_TOKEN }}
+          # 用默认 GITHUB_TOKEN：镜像推到本仓库自己名下的包，
+          # 配合上面 permissions.packages: write 就够了。
+          # （原项目用 secrets.GHCR_TOKEN，因为它把 public 包推到了
+          #   别人的 namespace，那才需要显式带 write:packages 的 PAT。）
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract metadata
         id: meta
@@ -125,7 +135,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          platforms: linux/amd64
+          platforms: linux/arm64
           cache-from: type=gha
           cache-to: type=gha,mode=max
           # 镜像含 Camoufox（2.4GB）+ Chromium（379MB），
