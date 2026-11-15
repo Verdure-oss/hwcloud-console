@@ -140,8 +140,37 @@ fi
 # Camoufox 和 Xvfb 会变成孤儿。改成前台跑 + 转发信号。
 cleanup() {
     [ -n "$CAMOUFOX_PID" ] && kill -TERM "$CAMOUFOX_PID" 2>/dev/null
+    pkill -f keepalive_daemon.sh 2>/dev/null
+    pkill -f daily_daemon.sh 2>/dev/null
+    pkill -f websockify 2>/dev/null
+    pkill -f x11vnc 2>/dev/null
     kill -TERM "$XVFB_PID" 2>/dev/null
 }
+
+# ==== 常驻子服务（PATCHED）====
+# 这几个服务原本没人管，容器重启就丢，导致：
+#   - VNC 黑屏（x11vnc / websockify 没了）
+#   - 会话不再自动续期（keepalive 守护没了）
+if [ -z "${VNC_PASSWORD:-}" ]; then
+    x11vnc -display ":${DISPLAY_NUM}" -forever -shared -nopw \
+           -rfbport 5901 -noxdamage >"$LOG_DIR/x11vnc.log" 2>&1 &
+    log "x11vnc 已启动 :5901（无密码，仅本机）"
+fi
+if [ -d /opt/hwcloud-demo/noVNC-1.5.0 ]; then
+    /opt/hwcloud-demo/venv/bin/python -m websockify \
+        --web /opt/hwcloud-demo/noVNC-1.5.0 \
+        6080 127.0.0.1:5901 >"$LOG_DIR/websockify.log" 2>&1 &
+    log "noVNC 已启动 :6080"
+fi
+if [ -x /opt/hwcloud-demo/keepalive_daemon.sh ]; then
+    /opt/hwcloud-demo/keepalive_daemon.sh >/dev/null 2>&1 &
+    log "保活守护已启动（间隔 ${KEEPALIVE_INTERVAL:-1200}s）"
+fi
+if [ -x /opt/hwcloud-demo/daily_daemon.sh ]; then
+    /opt/hwcloud-demo/daily_daemon.sh >/dev/null 2>&1 &
+    log "日常调度已启动（${DAILY_HOUR:-9}:${DAILY_MINUTE:-30} + 抖动）"
+fi
+# ==== 常驻子服务结束 ====
 
 log "启动主进程: hwcloud $*"
 /opt/hwcloud-demo/go/bin/hwcloud "$@" &

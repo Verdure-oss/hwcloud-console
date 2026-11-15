@@ -29,6 +29,12 @@ import sys
 import threading
 import time
 import traceback
+
+# MANUAL_TRUST_PATCH_V3
+
+# MANUAL_SAVE_PATCH_V2
+
+# MANUAL_MODE_PATCH_V1
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -229,6 +235,81 @@ class Session:
                 timeout=20)
         except Exception:
             pass
+
+
+    async def start_manual(self):
+        """手动模式：只打开登录页，之后完全由用户在 VNC 里操作。
+
+        与 start() 的区别：
+          - 不自动填账号密码
+          - 不自动点「登录」
+          - 不自动找验证码框
+        等用户自己登完，由 wait_manual_done() 轮询检测登录态。
+        """
+        from camoufox.async_api import AsyncCamoufox
+
+        profile_dir = str(self.dir / "browser_profile")
+        self.cm = AsyncCamoufox(headless=False, os="windows", locale="zh-CN",
+                                humanize=True, geoip=False,
+                                persistent_context=True,
+                                user_data_dir=profile_dir)
+        self.browser = await self.cm.__aenter__()
+        self.page = await self.browser.new_page()
+        self.page.set_default_timeout(60000)
+
+        async def on_resp(resp):
+            u = resp.url.lower()
+            if "getsdkbaseinfo" in u:
+                try:
+                    obj = json.loads(await resp.text())
+                    for k in ("pageToken", "pageTokenKey", "state"):
+                        if obj.get(k):
+                            self.sdk_info[k] = obj[k]
+                except Exception:
+                    pass
+
+        self.page.on("response", on_resp)
+        await self.page.goto(LOGIN_URL, wait_until="domcontentloaded",
+                             timeout=120000)
+        await self.page.wait_for_timeout(1500)
+        self.stage = "manual"
+        log(f"[{self.phone}] 手动模式：浏览器已打开，请在 VNC 里自行登录")
+        return "manual"
+
+    async def wait_manual_done(self, max_seconds=900):
+        """轮询等待用户手动登录完成（默认最多 15 分钟）。
+
+        判据：成长中心页面出现积分 / 不再有登录按钮。
+        """
+        deadline = time.time() + max_seconds
+        while time.time() < deadline:
+            try:
+                if self.page.is_closed():
+                    return {"ok": False, "stage": "closed",
+                            "error": "浏览器窗口被关闭"}
+            except Exception:
+                return {"ok": False, "stage": "closed",
+                        "error": "浏览器已关闭"}
+
+            try:
+                st = await self.page.evaluate(
+                    """() => {
+                        const body = document.body ? document.body.innerText : '';
+                        const hasLoginBtn = /登录\/注册|立即登录/.test(body);
+                        const hasPoints = /积分/.test(body) && !hasLoginBtn;
+                        return {hasLoginBtn, hasPoints, url: location.href};
+                    }""")
+            except Exception:
+                st = None
+
+            if st and st.get("hasPoints") and not st.get("hasLoginBtn"):
+                log(f"[{self.phone}] 手动模式：检测到已登录，开始保存会话")
+                return {"ok": True, "stage": "manual_done", "state": st}
+
+            await asyncio.sleep(3)
+
+        return {"ok": False, "stage": "timeout",
+                "error": f"等待手动登录超时（{max_seconds}s）"}
 
     async def start(self):
         from camoufox.async_api import AsyncCamoufox
@@ -1364,6 +1445,113 @@ async def drop_session(phone):
         log(f"[{phone}] 会话已丢弃")
 
 
+
+async def do_login_manual(phone, password=""):
+    """手动登录：打开浏览器后不自动操作，等用户自己登完再保存会话。"""
+    try:
+        await asyncio.wait_for(LOCK.acquire(), timeout=8)
+    except asyncio.TimeoutError:
+        return {"ok": False, "stage": "busy",
+                "error": "上一个登录还在进行，请点「重置会话」后重试"}
+
+    s = None
+    try:
+        s = SESSIONS.get(phone)
+        if s is not None:
+            await drop_session(phone)
+            s = None
+
+        s = Session(phone, password)
+        SESSIONS[phone] = s
+        log(f"[{phone}] 新建会话（手动模式）")
+
+        try:
+            await asyncio.wait_for(s.start_manual(), timeout=180)
+        except Exception as e:
+            log(f"[{phone}] 手动模式启动失败: {e}")
+            await drop_session(phone)
+            return {"ok": False, "stage": "start_failed", "error": str(e)[:300]}
+
+        res = await s.wait_manual_done(max_seconds=900)
+        if not res.get("ok"):
+            log(f"[{phone}] 手动模式未完成: {res.get('error')}")
+            await drop_session(phone)
+            return res
+
+
+        # ---- 信任设备（MANUAL_TRUST_PATCH_V3）----
+        # 手动模式不会走 submit_sms 那条路径，所以必须在这里补上
+        # updateTrustBrowser —— 否则每次登录都要重新过验证码。
+        # 必须在 finish() 之前调用：finish 会导航到别的域，
+        # 届时 id1.cloud.huawei.com 的会话上下文就不好用了。
+        try:
+            log(f"[{phone}] 手动模式：尝试标记设备为可信…")
+            self_trusted = await s.trust_device()
+            s.trusted = bool(self_trusted)
+            log(f"[{phone}] 信任设备结果: {s.trusted}")
+        except Exception as _te:
+            log(f"[{phone}] 信任设备失败: {_te}")
+        # ---- 信任设备结束 ----
+
+        # 用户已登录，走原有收尾逻辑保存 cookies
+        try:
+            fin = await asyncio.wait_for(s.finish(), timeout=180)
+        except asyncio.TimeoutError:
+            await drop_session(phone)
+            return {"ok": False, "stage": "timeout",
+                    "error": "收尾超时，已清理会话"}
+
+        # ---- 落盘（MANUAL_SAVE_PATCH_V2）----
+        try:
+            import pathlib as _pl
+            _state = _pl.Path("/opt/hwcloud-demo/accounts") / phone / "state"
+            _state.mkdir(parents=True, exist_ok=True)
+            _cookies = fin.get("cookies") or []
+            _out = []
+            for _c in _cookies:
+                _exp = _c.get("expires")
+                try:
+                    _exp = int(float(_exp))
+                    if _exp < 0:
+                        _exp = 0
+                except Exception:
+                    _exp = 0
+                _out.append({
+                    "name": _c.get("name", ""),
+                    "value": _c.get("value", ""),
+                    "domain": _c.get("domain", ""),
+                    "path": _c.get("path") or "/",
+                    "expires": _exp,
+                    "httpOnly": bool(_c.get("httpOnly")),
+                    "secure": bool(_c.get("secure")),
+                })
+            _tmp = _state / "cookies.json.tmp"
+            with io.open(_tmp, "w", encoding="utf-8") as _f:
+                json.dump(_out, _f, ensure_ascii=False, indent=2)
+            os.replace(_tmp, _state / "cookies.json")
+            _meta = fin.get("meta") or {}
+            _mtmp = _state / "meta.json.tmp"
+            with io.open(_mtmp, "w", encoding="utf-8") as _f:
+                json.dump(_meta, _f, ensure_ascii=False, indent=2)
+            os.replace(_mtmp, _state / "meta.json")
+            log(f"[{phone}] 已写入 {len(_out)} 个 cookie 到 {_state}")
+            fin["saved_to"] = str(_state / "cookies.json")
+            fin["trusted"] = bool(getattr(s, "trusted", False))
+        except Exception as _e:
+            log(f"[{phone}] 写盘失败: {_e}")
+            fin["save_error"] = str(_e)
+        # ---- 落盘结束 ----
+
+        await drop_session(phone)
+        return fin
+    finally:
+        if LOCK.locked():
+            try:
+                LOCK.release()
+            except Exception:
+                pass
+
+
 async def do_login(phone, password, sms_code):
     # LOCK 必须带超时获取。早先是 `async with LOCK` 无限等：
     # 上一个登录卡死时，后续所有请求会在 LOCK 上排队挂到 HTTP 超时，
@@ -1455,8 +1643,12 @@ async def do_login(phone, password, sms_code):
 #
 # 取 SMS_TTL + 2 分钟：短信有效期 480s，再加点余量给用户输码。
 # 最短 10 分钟，避免 SMS_TTL 被调小时回收得太激进。
+# MANUAL_KEEPALIVE_V5
+# 手动模式要等用户慢悠悠输账号/过验证码，10 分钟根本不够
+# （实测有人花 12 分钟才登完，浏览器被 reaper 提前关了，VNC 直接黑屏）。
+# 默认放宽到 30 分钟，可用 HWLOGIN_SESSION_MAX 覆盖。
 SESSION_MAX_AGE = max(float(os.environ.get("HWLOGIN_SESSION_MAX", "0")) or 0,
-                      SMS_TTL + 120, 600)
+                      SMS_TTL + 120, 1800)
 
 
 async def _reaper():
@@ -1470,6 +1662,11 @@ async def _reaper():
                 continue
             age = now - getattr(s, "created", now)
             # 正在跑登录流程的不动（stage 还在推进）
+            # 手动模式：用户可能在慢慢操作，不要按普通上限回收，
+            # 单独给 30 分钟硬上限（防止真的走开后僵尸占内存）。
+            if s.stage == "manual":
+                if age < 1800:
+                    continue
             if s.stage in ("new", "checking"):
                 if age < 900:      # 15 分钟还没推进 = 卡死
                     continue
@@ -1556,6 +1753,20 @@ class Handler(BaseHTTPRequestHandler):
 
             asyncio.run_coroutine_threadsafe(_reset_all(), LOOP)
             self._json(200, {"ok": True, "cleared": n})
+            return
+
+        if p == "/manual":
+            if not phone:
+                self._json(400, {"ok": False, "error": "phone required"})
+                return
+            payload_pw = password or ""
+            try:
+                res = asyncio.run_coroutine_threadsafe(
+                    do_login_manual(phone, payload_pw), LOOP).result(timeout=1200)
+                self._json(200, res)
+            except Exception as e:
+                log(f"[{phone}] 手动模式异常 {e}")
+                self._json(500, {"ok": False, "error": str(e)[:300]})
             return
 
         if not phone:

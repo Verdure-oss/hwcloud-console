@@ -58,8 +58,14 @@ RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors
 #   libnss3/libatk*  Chromium 运行时依赖（缺了报 libnss3.so not found）
 #   libgtk-3-0       Camoufox（Firefox）运行时依赖
 #
-# 刻意不装：xvfb 之外的其他 X 组件、firefox 包（Camoufox 自带）、
-# libasound2（无声卡环境用不到，但 Chromium 会警告不影响运行）
+# 刻意不装：xvfb 之外的其他 X 组件、firefox 包（Camoufox 自带）
+#
+# libasound2 必须装 —— 早期注释说「无声卡环境用不到，Chromium 只会警告」，
+# 这个判断是错的。实测（2026-11-15）缺它时 Chromium 和 Camoufox **都启动不了**：
+#   chrome: error while loading shared libraries: libasound.so.2
+#   退出码 127，报错被 Playwright 包成「target closed」，
+#   表面看是「浏览器莫名关闭」，极难排查。
+#   影响范围不只是自动登录，提 Issue / Star / 活动报名 / 云实验全部瘫痪。
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates tzdata curl \
         xvfb x11vnc \
@@ -70,6 +76,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
         libgbm1 libpango-1.0-0 libcairo2 \
         libgtk-3-0 libdbus-glib-1-2 libxt6 \
+        libasound2 \
     && rm -rf /var/lib/apt/lists/*
 
 ENV TZ=Asia/Shanghai \
@@ -113,7 +120,7 @@ RUN python3 -m venv /opt/hwcloud-demo/venv \
         -i https://pypi.tuna.tsinghua.edu.cn/simple \
     && /opt/hwcloud-demo/venv/bin/pip install --no-cache-dir \
         -i https://pypi.tuna.tsinghua.edu.cn/simple \
-        "camoufox[geoip]==0.5.8" "playwright==1.62.0"
+        "camoufox[geoip]==0.5.8" "playwright==1.62.0" "websockify==0.13.0"
 
 # 预下载浏览器到镜像内的 baked 目录。
 #
@@ -136,8 +143,18 @@ RUN export XDG_CACHE_HOME=/tmp/camoufox-build \
 
 # 应用
 COPY assets/hwcloud ./go/bin/hwcloud
+# noVNC：面板 /vnc/ 反代到 :6080，websockify 需要它提供网页与 JS。
+# 缺了表现是「/vnc/ 返回 502」或画面黑，而 VNC 客户端直连 5901 却正常。
+COPY novnc/ /opt/hwcloud-demo/noVNC-1.5.0/
+
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY camoufox_server.py /opt/hwcloud-demo/camoufox_server.py
+
+# 常驻守护：会话保活 + 每日任务自动调度。
+# 容器里没有 systemd / cron，entrypoint 直接以子进程方式拉起。
+COPY daily_daemon.sh /opt/hwcloud-demo/daily_daemon.sh
+COPY keepalive_daemon.sh /opt/hwcloud-demo/keepalive_daemon.sh
+RUN chmod +x /opt/hwcloud-demo/daily_daemon.sh /opt/hwcloud-demo/keepalive_daemon.sh
 COPY assets/data/ ./data/
 
 RUN chmod +x ./go/bin/hwcloud /usr/local/bin/entrypoint.sh \
