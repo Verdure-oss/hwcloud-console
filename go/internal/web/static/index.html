@@ -265,6 +265,23 @@
       </div>
     </div>
 
+    <!-- 登录过程中的 VNC 入口。
+         为什么要有：登录会拉起服务器上的浏览器，遇到滑块或短信时用户
+         必须看到画面才能操作。原来这个弹窗只有「正在启动浏览器…」的
+         文字进度，用户根本不知道去哪看画面，只能干等 —— 实测 2026-11-19
+         用户点了「重新登录」后一直等不到跳转，就是因为这里没有入口。 -->
+    <div id="loginVncRow" style="display:none">
+      <label>画面</label>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <a class="btn sm primary" href="/vnc/" target="_blank" rel="noopener">
+          在浏览器中打开画面
+        </a>
+        <span class="hint" style="font-weight:normal">
+          卡在滑块或需要短信时，在这里操作
+        </span>
+      </div>
+    </div>
+
     <div id="smsBlock" style="display:none">
       <label>短信验证码</label>
       <input id="loginCode" placeholder="6 位数字" maxlength="6" inputmode="numeric">

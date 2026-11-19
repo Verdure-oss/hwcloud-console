@@ -708,17 +708,53 @@ func RunDevSpaceBrowser(sess *huawei.Session, headless bool) (map[string]any, er
 	}
 	target.WaitForTimeout(8000)
 
-	// 用鸿蒙任务状态确认（成长中心是最终判定方，这里只做记录）
-	status := ""
-	if c, err := newHarmonyClient(sess); err == nil {
-		if _, _, err := c.call("/api/growth/tasks", http.MethodGet, nil); err == nil {
-			status = "visited"
-		}
+	// DEVSPACE_VERIFY_PATCH
+	//
+	// 原来这里无条件 return nil 错误，只要函数走到末尾就算成功 ——
+	// 哪怕 clicked=false（压根没找到「前往AI DevSpace实践」按钮）。
+	// 结果 runDaily 记「已通过浏览器体验」，但成长中心的
+	// 「每日体验AI DevSpace」一直未完成，而日志看不出任何异常。
+	// 实测 2026-11-19 就是这样：日志说成功，任务列表说未完成。
+	//
+	// 现在分三档：
+	//   clicked=false           → 明确报错（按钮没找到，多半页面改版）
+	//   clicked=true 但没进空间 → 报错（点击无效或被拦）
+	//   clicked=true 且已进入   → 成功
+	entered := false
+	if u := target.URL(); strings.Contains(u, "devstation") ||
+		strings.Contains(u, "devspace") || strings.Contains(u, "aidevspace") {
+		entered = true
 	}
+
+	finalURL := target.URL()
+	if !clicked {
+		return map[string]any{
+			"clicked":   false,
+			"final_url": finalURL,
+			"reason":    "找不到「前往AI DevSpace实践」按钮",
+		}, fmt.Errorf("DevSpace 未完成：找不到「前往AI DevSpace实践」按钮（页面可能改版）")
+	}
+	if !entered {
+		return map[string]any{
+			"clicked":   true,
+			"final_url": finalURL,
+			"reason":    "点击后未进入 DevSpace 空间",
+		}, fmt.Errorf("DevSpace 未完成：点击后未跳转到 DevSpace（当前 URL: %s）",
+			clipURL(finalURL))
+	}
+
 	return map[string]any{
-		"clicked":  clicked,
-		"final_url": target.URL(),
-		"status":   status,
+		"clicked":   true,
+		"final_url": finalURL,
+		"status":    "entered",
 	}, nil
+}
+
+// clipURL 截断 URL，避免错误信息过长。
+func clipURL(u string) string {
+	if len(u) > 80 {
+		return u[:80] + "..."
+	}
+	return u
 }
 

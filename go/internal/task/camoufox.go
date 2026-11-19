@@ -127,6 +127,38 @@ func CamoufoxLogin(phone, password, smsCode string) (*CamoufoxResult, error) {
 	return camoufoxPost("/login", payload, 280*time.Second)
 }
 
+// CamoufoxLoginManual 纯手动登录：服务端只打开登录页，不做任何自动操作。
+//
+// 为什么必须和 CamoufoxLogin / CamoufoxLoginSemi 区分开（2026-11-19）：
+//   那两个都会自动填账号密码并点登录，然后在第 3 秒就判定验证类型，
+//   自顾自往下走（点「获取验证码」、CAS 换票）。用户在 VNC 里
+//   拖滑块时脚本早跳到别的页面，两边抢同一个浏览器，必然失败。
+//   实测反复失败就是这么来的。
+//   手动模式什么都不做，把页面交给用户，脚本只负责最后的保存。
+//
+// 超时 1900 秒：服务端 wait_manual_done 主循环 1500 秒，
+// 加浏览器启动与收尾换票，留足余量。
+func CamoufoxLoginManual(phone string) (*CamoufoxResult, error) {
+	payload := map[string]any{"phone": phone}
+	return camoufoxPost("/manual", payload, 1900*time.Second)
+}
+
+// CamoufoxLoginSemi 半自动登录：服务端自动填账号密码并点登录，
+// 验证码（滑块/短信）留给用户在 VNC 里操作。
+//
+// 为什么需要它（2026-11-19）：
+//   全自动走不通 —— 滑块定位文件 slider_locate.py 在镜像里缺失，
+//   打码服务也没配；设备信任偶尔生效但不稳定。
+//   纯手动又要用户从头输账号密码。折中：机器填表，人过验证码。
+//
+// 超时给 1900 秒（约 31 分钟）：服务端 wait_semi_done 主循环是 1500 秒，
+// 加上启动浏览器、收尾换票，留足余量。别设太小，
+// 用户可能正走开去拿手机等短信。
+func CamoufoxLoginSemi(phone, password string) (*CamoufoxResult, error) {
+	payload := map[string]any{"phone": phone, "password": password}
+	return camoufoxPost("/semi", payload, 1900*time.Second)
+}
+
 // CamoufoxLogout 让服务端丢弃该账号的会话并关闭浏览器。
 //
 // 为什么需要：Camoufox 是单实例服务，一个账号开着的浏览器会一直占着

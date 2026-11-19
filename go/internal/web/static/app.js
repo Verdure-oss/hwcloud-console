@@ -526,6 +526,7 @@ function renderAccount(a){
         gitcodeBtn(a) +
         act('run', 'harmony-bind', '鸿蒙绑定') +
         act('run', 'keepalive', '保活') +
+        act('manual', '', '手动登录', 'primary') +
         act('relogin', '', '重新登录') +
         act('beans', '', '积分') +
         act('check', '', '检查') +
@@ -605,7 +606,9 @@ function bindAccountActions(){
       case 'remark': editRemark(arg || id); break;
       // 重新登录：用服务器上存的账号密码重走一遍完整登录流程
       // （滑块自动过、短信验证码照常填），不需要用户再输密码。
+      case 'manual':   startManualLogin(id); break;
       case 'relogin':  startRelogin(id); break;
+      case 'semilogin': startSemiLogin(id); break;
       case 'beans':    queryBeans(id); break;
       // 自动保活开关。data-arg 是**目标状态**（on/off），
       // 渲染时就按当前状态算好了，这里不用再判断。
@@ -647,6 +650,97 @@ async function doAdd(){
     setTimeout(() => doLogin(), 300);
   }catch(e){
     showMsg('addMsg', e.message, false);
+  }
+}
+
+// startSemiLogin 半自动登录：后端自动填账号密码并点登录，
+// 验证码（滑块/短信）交给你在 /vnc/ 里操作。
+//
+// 为什么单独做一个按钮（2026-11-19）：
+//   - 「重新登录」走全自动，但滑块定位文件缺失 + 打码服务未配，必然失败
+//   - 全手动又要从头输账号密码
+//   半自动是折中：机器填表，人过验证码。
+//
+// 这是长请求（最长约 30 分钟，等用户操作验证码），
+// 所以点完立刻把 VNC 入口摊开给用户，并提示「等待中」。
+async function startSemiLogin(id){
+  const ok = confirm(
+    '半自动登录会用已保存的密码自动填表并点「登录」，\n' +
+    '然后需要你在 VNC 画面里过滑块或填短信验证码。\n\n' +
+    '现在开始吗？（最长等待 30 分钟）'
+  );
+  if(!ok) return;
+
+  // 立刻把 VNC 面板摊开 —— 用户等的就是看得见画面。
+  // 直接操作 DOM 而不再套一层函数：gitcode 弹窗里的 vnc-box 就是复用这块 UI。
+  openGitCode(id);
+  $('gcVnc').hidden = false;
+  if(typeof refreshVncInfo === 'function') { try { refreshVncInfo(); } catch(e){} }
+
+  showMsg('globalMsg', '半自动登录已启动，正在打开浏览器…（约 15 秒）', true);
+  try{
+    const r = await api('/api/accounts/semi-login', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ id })
+    });
+    if(r.ok){
+      showMsg('globalMsg', '登录成功（用时 ' + (r.elapsed||'') + '）', true);
+      loadAccounts();
+    }else{
+      showMsg('globalMsg',
+        '登录未完成：' + (r.error || r.stage || '未知原因') +
+        '  可在 VNC 里重试，或点「重新登录」', false);
+    }
+  }catch(e){
+    showMsg('globalMsg', '半自动登录失败：' + e.message, false);
+  }
+}
+
+// startManualLogin 纯手动登录：服务端只打开登录页，之后全由用户在 VNC 里操作。
+//
+// 为什么单独做一个按钮，而且放在「重新登录」前面（2026-11-19）：
+//   「重新登录」走全自动 —— 它自己填账号密码、自己点登录，
+//   第 3 秒就判定验证类型然后自顾自往下走（尝试点「获取验证码」、
+//   尝试 CAS 换票），根本不用户操作。用户在 VNC 里拖滑块时，
+//   脚本早跳到别的页面了，两边抢同一个浏览器，必然失败。
+//   手动模式什么都不做，只把页面打开，等用户慢慢操作。
+//
+// 这是长请求（服务端最长等 30 分钟），所以：
+//   1. 点完立刻把 VNC 入口摆出来
+//   2. 不阻塞 UI，用 fetch 但提示「等待中」
+async function startManualLogin(id){
+  const ok = confirm(
+    '手动登录会打开一个空的华为云登录页，之后完全由你在 VNC 里操作：\n' +
+    '  输入账号密码 → 点登录 → 拖滑块 / 填短信验证码\n\n' +
+    '脚本不会自动填表，也不会和你抢操作。\n' +
+    '最长等待 30 分钟。\n\n' +
+    '现在开始吗？'
+  );
+  if(!ok) return;
+
+  // 先开 VNC 入口（用户第一件事就是去看画面）
+  openLogin(id, '', false);
+  $('loginPhone').value = (accounts.find(x => x.id === id) || {}).phone || id;
+  $('loginVncRow').style.display = '';
+  $('cscBlock').style.display = '';
+  $('cscHint').textContent = '正在打开登录页…（约 15 秒，之后请到右上方「在浏览器中打开画面」操作）';
+
+  try{
+    const r = await api('/api/accounts/manual-login', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ id })
+    });
+    if(r.ok){
+      $('cscHint').textContent = '✅ 登录成功，会话已保存';
+      showMsg('loginMsg', '登录成功', true);
+      loadAccounts();
+    }else{
+      $('cscHint').textContent = '登录未完成：' + (r.error || r.stage || '未知');
+      showMsg('loginMsg', '登录未完成：' + (r.error || r.stage || ''), false);
+    }
+  }catch(e){
+    $('cscHint').textContent = '请求失败：' + e.message;
+    showMsg('loginMsg', '请求失败：' + e.message, false);
   }
 }
 
@@ -785,6 +879,9 @@ function openLogin(id, presetPassword, useStored){
   // 从「添加账号」进来时密码已经填过，直接复用，不用再输一遍
   $('loginPassword').value = useStored ? '' : (presetPassword || '');
   $('loginCode').value = '';
+  // 登录过程中随时可能弹滑块/短信，把 VNC 入口直接摆出来，
+  // 用户不用猜「画面在哪」。
+  $('loginVncRow').style.display = '';
   $('cscBlock').style.display = 'none';
   $('cscBox').innerHTML = '<div class="csc-hint" id="cscHint">正在启动浏览器…</div>';
   $('smsBlock').style.display = 'none';

@@ -213,6 +213,8 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/accounts/autokeepalive", guard(s.handleAccountAutoKeepAlive))
 	mux.HandleFunc("/api/accounts/check", guard(s.handleCheckAccount))
 	mux.HandleFunc("/api/accounts/login", guard(s.handleAccountLogin))
+	mux.HandleFunc("/api/accounts/semi-login", guard(s.handleAccountSemiLogin))
+	mux.HandleFunc("/api/accounts/manual-login", guard(s.handleAccountManualLogin))
 	mux.HandleFunc("/api/accounts/captcha", guard(s.handleCaptcha))
 	mux.HandleFunc("/api/accounts/captcha/image", guard(s.handleCaptchaImage))
 	mux.HandleFunc("/api/accounts/captcha/submit", guard(s.handleCaptchaSubmit))
@@ -955,6 +957,185 @@ type loginReq struct {
 }
 
 // handleAccountLogin 处理登录相关动作。
+// handleAccountManualLogin 纯手动登录：服务端只打开登录页，之后全交用户。
+//
+// 和 semi-login 的区别：
+//   semi-login 会自动填账号密码并点登录，然后自己判定验证类型往下走 ——
+//   用户在 VNC 里操作时脚本会抢同一个浏览器，实测必然失败。
+//   manual-login 什么都不做，只打开页面，等用户在 VNC 里自己登完。
+//
+// 这是同步长请求（最长约 30 分钟）。前端点完应立刻展示 VNC 入口，
+// 并提示「等待中」，不要让用户以为卡死了。
+func (s *Server) handleAccountManualLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	var req loginReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+
+	acc, ok := s.store.Get(req.ID)
+	if !ok {
+		writeJSON(w, map[string]any{"error": "账号不存在"})
+		return
+	}
+
+	phone := req.Phone
+	if phone == "" || strings.Contains(phone, "*") {
+		phone = acc.Phone
+	}
+
+	// 串行化：同一时刻只允许一个登录流程，避免开两个浏览器互相干扰
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+
+	svcLog("[manual] %s 打开手动登录页（请到 /vnc/ 操作）", req.ID)
+	start := time.Now()
+	res, err := task.CamoufoxLoginManual(phone)
+	elapsed := time.Since(start).Round(time.Second)
+
+	if err != nil && (res == nil || res.Stage == "") {
+		svcLog("[manual] %s 失败（%s）：%v", req.ID, elapsed, err)
+		writeJSON(w, map[string]any{"error": err.Error(), "elapsed": elapsed.String()})
+		return
+	}
+	if res == nil {
+		writeJSON(w, map[string]any{"error": "登录服务未返回结果"})
+		return
+	}
+
+	if res.Stage == "done" {
+		_ = s.store.Update(req.ID, func(a *account.Account) {
+			a.LastError = ""
+			a.Alive = true
+			a.Trusted = res.Trusted
+			if v, ok := res.Meta["login_at"].(string); ok && v != "" {
+				a.LastCheck = v
+			}
+		})
+		// 登录成功后清掉人工登录标记（keepalive 守护会写这个文件）
+		_ = os.Remove(filepath.Join(config.Root(), "state", "NEED_MANUAL_LOGIN"))
+		svcLog("[manual] %s 登录成功（%s）", req.ID, elapsed)
+	} else {
+		msg := res.Error
+		if msg == "" {
+			msg = "登录未完成（stage=" + res.Stage + "）"
+		}
+		_ = s.store.Update(req.ID, func(a *account.Account) {
+			a.LastError = "手动登录: " + msg
+		})
+		svcLog("[manual] %s 未完成（%s）：%s", req.ID, elapsed, msg)
+	}
+
+	writeJSON(w, map[string]any{
+		"ok":      res.Stage == "done",
+		"stage":   res.Stage,
+		"trusted": res.Trusted,
+		"elapsed": elapsed.String(),
+		"error":   res.Error,
+	})
+}
+
+// handleAccountSemiLogin 半自动登录：后端填表，验证码交用户在 VNC 里过。
+//
+// 和 handleAccountLogin 的区别：
+//   - login 走 CamoufoxLogin（全自动，含自动过滑块），
+//     但滑块定位文件缺失、打码服务未配，实测必然失败
+//   - semi-login 走 CamoufoxLoginSemi，只填账号密码点登录，
+//     然后把控制权交回用户 —— 用户在面板 /vnc/ 里拖滑块、填短信
+//
+// 返回值语义：这是同步长请求（最长 30 分钟）。前端拿到结果时，
+// 用户已经完成验证（或超时）。所以前端要显示「等待中」并给 VNC 入口。
+func (s *Server) handleAccountSemiLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	var req loginReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+
+	acc, ok := s.store.Get(req.ID)
+	if !ok {
+		writeJSON(w, map[string]any{"error": "账号不存在"})
+		return
+	}
+
+	phone := req.Phone
+	if phone == "" || strings.Contains(phone, "*") {
+		phone = acc.Phone
+	}
+
+	// 密码优先用请求里的（用户可能临时改过），否则用存储的
+	password := req.Password
+	if password == "" {
+		password = acc.Password
+	}
+	if password == "" {
+		writeJSON(w, map[string]any{
+			"error": "没有可用密码。请先用「添加账号」录入密码，或在面板里填一次",
+			"need_password": true,
+		})
+		return
+	}
+
+	// 同一账号的登录串行化，避免重复开浏览器
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+
+	svcLog("[semi] %s 开始半自动登录（请到 /vnc/ 完成验证码）", req.ID)
+	start := time.Now()
+	res, err := task.CamoufoxLoginSemi(phone, password)
+	elapsed := time.Since(start).Round(time.Second)
+
+	if err != nil && (res == nil || res.Stage == "") {
+		svcLog("[semi] %s 失败（%s）：%v", req.ID, elapsed, err)
+		writeJSON(w, map[string]any{"error": err.Error(), "elapsed": elapsed.String()})
+		return
+	}
+	if res == nil {
+		writeJSON(w, map[string]any{"error": "登录服务未返回结果"})
+		return
+	}
+
+	// 成功后刷新账号状态
+	if res.Stage == "done" {
+		_ = s.store.Update(req.ID, func(a *account.Account) {
+			a.LastError = ""
+			a.Alive = true
+			a.Trusted = res.Trusted
+			// Meta 是 map[string]any（camoufox 原样回传的 JSON），
+			// 不能直接点字段取，只能类型断言。
+			if v, ok := res.Meta["login_at"].(string); ok && v != "" {
+				a.LastCheck = v
+			}
+		})
+		svcLog("[semi] %s 登录成功（%s）", req.ID, elapsed)
+	} else {
+		msg := res.Error
+		if msg == "" {
+			msg = "登录未完成（stage=" + res.Stage + "）"
+		}
+		_ = s.store.Update(req.ID, func(a *account.Account) {
+			a.LastError = "半自动登录: " + msg
+		})
+		svcLog("[semi] %s 未完成（%s）：%s", req.ID, elapsed, msg)
+	}
+
+	writeJSON(w, map[string]any{
+		"ok":      res.Stage == "done",
+		"stage":   res.Stage,
+		"trusted": res.Trusted,
+		"elapsed": elapsed.String(),
+		"error":   res.Error,
+	})
+}
+
 func (s *Server) handleAccountLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", 405)
