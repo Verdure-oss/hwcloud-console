@@ -65,6 +65,35 @@ while true; do
         log "到达触发时间，抖动 ${jitter}s 后开始日常"
         sleep "$jitter"
 
+        # 先探一次会话。离线就整轮跳过 —— 否则 all daily 会对每个账号
+        # 尝试一次自动登录，必然因「未保存密码 / 需验证码」失败，
+        # 日志被几十条同样的报错刷满，看不出真正的问题。
+        #
+        # 判定方式用 `session` 而不是 `keepalive`：前者只做一次 HTTP 探测，
+        # 不触发浏览器，开销小；后者在失效时会尝试拉起 profile 续期。
+        alive=""
+        for dd in /opt/hwcloud-demo/accounts/*/; do
+            [ -f "$dd/state/cookies.json" ] || continue
+            aid=$(basename "$dd")
+            astate=$(HWCLOUD_ACCOUNT="$aid" timeout 60 "$BIN" session 2>/dev/null \
+                     | tr -d '\n' | sed 's/  */ /g')
+            case "$astate" in
+                *'"alive":true'*|*'"alive": true'*) alive="yes" ;;
+                *) alive="no" ;;
+            esac
+            break
+        done
+
+        if [ "$alive" = "no" ]; then
+            if [ -f /opt/hwcloud-demo/state/NEED_MANUAL_LOGIN ]; then
+                log "会话离线（已有 NEED_MANUAL_LOGIN 标记），跳过今日任务。请手动登录后重试"
+            else
+                log "会话离线，跳过今日任务。请手动登录（详见 /opt/hwcloud-demo/state/NEED_MANUAL_LOGIN）"
+            fi
+            sleep 300
+            continue
+        fi
+
         log "开始执行 hwcloud all daily"
         start=$(date +%s)
         out=$("$BIN" all daily 2>&1)
