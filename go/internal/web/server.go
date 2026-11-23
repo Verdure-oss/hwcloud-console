@@ -1067,6 +1067,10 @@ func taskLabel(name string) string {
 		return "Star"
 	case "eventjoin":
 		return "活动报名"
+	case "grape":
+		return "Star Grape"
+	case "ict":
+		return "ICT创新赛"
 	case "gitcode":
 		return "GitCode"
 	case "bindgitcode":
@@ -2555,6 +2559,25 @@ func (s *Server) handleRunTask(w http.ResponseWriter, r *http.Request) {
 		case "eventjoin":
 			// 报名一个进行中的开发者活动
 			res, err := task.JoinEvent(false)
+			if err != nil {
+				return map[string]any{"error": err.Error()}
+			}
+			return res
+
+		case "grape":
+			// Star 开源项目 Grape 代码仓（新清单一次性 +50）。
+			// 判据在成长中心，绑定态在实践中心 /api/github/status；
+			// 没绑 GitHub 会如实返回 need_bind，不伪造成功。
+			res, err := task.StarGrapeRepo(false)
+			if err != nil {
+				return map[string]any{"error": err.Error()}
+			}
+			return res
+
+		case "ict":
+			// 报名华为 ICT 大赛创新赛（新清单一次性 +350）。
+			// 只做只读探测：报名/实名为人工步骤，这里如实回报当前卡在哪一步。
+			res, err := task.ICTInnovationStatus(false)
 			if err != nil {
 				return map[string]any{"error": err.Error()}
 			}
