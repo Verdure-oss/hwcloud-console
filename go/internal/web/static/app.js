@@ -675,13 +675,12 @@ async function startRelogin(id){
   setTimeout(() => doLogin(), 200);
 }
 
-// queryBeans 查一次实时积分。
+// queryBeans 查一次积分。
 //
-// 为什么不复用列表里的 beans 字段：那个有 60 秒缓存，而且离线时是 -1。
-// 用户点这个按钮就是想要「现在的准确值」，所以走单独的 /run?name=beans。
-//
-// 后端用 withAccountTry，长任务占着锁时会立刻返回 busy ——
-// 这里如实提示「稍后再查」，不假装成功也不让用户干等。
+// 2026-11-23 积分显示改走缓存机制：面板列表上的积分是**缓存值**
+// （做完任务/显式操作时后端自动刷新），点这个按钮是显式操作，
+// 后端现查一次并更新缓存。现查失败时后端回读缓存并标 stale，
+// 这里把「显示的是缓存值」如实告诉用户，不假装是实时值。
 async function queryBeans(id){
   const a = accounts.find(x => x.id === id);
   const label = a ? a.phone : id;
@@ -694,8 +693,12 @@ async function queryBeans(id){
       showMsg('globalMsg', label + ' 积分查询失败: ' + r.error, false);
       return;
     }
-    showMsg('globalMsg', label + ' 当前积分：' + r.beans, true);
-    // 重新拉列表 —— 后端已经把新积分写进 beansCache，这次刷新会显示新值
+    if(r.stale){
+      showMsg('globalMsg', label + ' 现查失败，显示缓存值 ' + r.beans + '（' + r.cached_at + ' 更新）', false);
+    }else{
+      showMsg('globalMsg', label + ' 当前积分：' + r.beans, true);
+    }
+    // 重新拉列表 —— 后端已经把新积分写进持久缓存，这次刷新会显示新值
     loadAccounts();
   }catch(e){
     showMsg('globalMsg', label + ' 积分查询失败: ' + e.message, false);

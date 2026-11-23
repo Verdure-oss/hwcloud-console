@@ -44,10 +44,10 @@ type Server struct {
 	loginFailMu sync.Mutex
 	loginFailAt map[string]time.Time
 
-	// 积分缓存：前端每 45 秒轮询账号列表，积分变得很慢，
-	// 每次都查远程接口会把列表页拖到超时。缓存 60 秒。
-	beansMu    sync.Mutex
-	beansCache map[string]beanEntry
+	// 积分缓存已迁移到 points_cache.go（跨进程持久化，state/points_cache.json）。
+	// 2026-11-23：旧的 60 秒内存缓存（beansCache）被它替代 ——
+	// CLI 定时任务是独立进程，内存缓存在那边写不进面板进程，
+	// 落盘缓存才能让「CLI 跑完任务 → 面板显示新积分」成立。
 
 	// 账号探测结果缓存 + 后台刷新单飞标志。
 	//
@@ -81,12 +81,6 @@ type jobState struct {
 	Ended   time.Time      `json:"ended"`
 }
 
-// beanEntry 是积分缓存项。
-type beanEntry struct {
-	val int
-	at  time.Time
-}
-
 // pendingAccount 是「待定账号」：密码已验证通过，但登录流程还没走完。
 // 只有登录成功后才真正写进 store，失败就丢掉，列表里不会出现。
 type pendingAccount struct {
@@ -108,7 +102,6 @@ func NewServer(addr string) (*Server, error) {
 		addr:        addr,
 		pending:     map[string]pendingAccount{},
 		loginFailAt: map[string]time.Time{},
-		beansCache:  map[string]beanEntry{},
 		probeCache:  map[string]probeSnapshot{},
 		jobs:        map[string]*jobState{},
 	}, nil
@@ -413,6 +406,12 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 	//   - 立刻用上次探测结果（缓存）组装响应
 	//   - 同时起一个后台 goroutine 去刷新，前端下次轮询就能看到新值
 	//   - 同一时刻只允许一个刷新在跑，避免任务堆积
+	//
+	// 2026-11-23 积分改为**纯缓存显示**：
+	// 轮询路径不再查远程接口（以前 beansCache 未命中时会现查，会话稍有不稳
+	// 就触发整条重登链路，列表页也跟着变慢）。积分只有做完任务/显式操作
+	// 才变，由那些时机写持久缓存（见 points_cache.go），这里只读缓存 ——
+	// 没有缓存时显示 -1（前端显示 —），不阻塞、不联网。
 	beansOf := make(map[string]int, len(list))
 	for i := range list {
 		a := &list[i]
@@ -423,9 +422,11 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 			}
 			a.RemainDays = snap.Remain
 			a.LastCheck = snap.At.Format("2006-01-02 15:04:05")
-			beansOf[a.ID] = snap.Beans
+		}
+		if e, ok := cachedPointsEntry(a.ID); ok {
+			beansOf[a.ID] = e.Points
 		} else {
-			// 没有缓存时用磁盘上的旧值，别让字段是空的
+			// 无缓存显示 -1（前端显示 —），绝不现查
 			beansOf[a.ID] = -1
 		}
 	}
@@ -558,47 +559,18 @@ func (s *Server) probeAccountTry(id string) bool {
 
 // probeAccountFull 同 probeAccount，额外返回积分（beans）。
 //
-// 积分单独取：它在 /growth/bonus-beans，和会话检查不是同一个接口。
-// 账号离线时接口会失败，这里返回 -1 表示「取不到」，前端显示成 —，
-// 不要显示成 0（0 会被误读成「积分清零了」）。
-//
-// 积分有 60 秒缓存：handleAccounts 会被前端每 45 秒轮询一次，
-// 每次都查一遍远程接口会让列表页明显变慢，而积分本来就变得很慢。
+// 2026-11-23 积分改为**纯缓存**：探测（会话检查）本身仍照常做，
+// 但积分一律读持久缓存（points_cache.go），不再远程现查 ——
+// 探测只应该回答「账号在不在线」，不该顺带触发积分接口的重登链路。
+// 缓存由「做完任务 / 点积分按钮 / 推送」等显式时机更新。
+// 返回 -1 表示「没有缓存」，前端显示 —，不要显示成 0
+// （0 会被误读成「积分清零了」）。
 func (s *Server) probeAccountFull(id string) (bool, string, float64, int) {
 	var alive bool
 	var username string
 	var remain float64
 	beans := -1
 
-	// 积分缓存：命中就不用再去远程查。
-	//
-	// 注意这里必须在拿账号锁**之前**读缓存，且只在同一把锁内使用缓存值 ——
-	// 见下面「为什么必须合并成一次 withAccountTry」的说明。
-	beansCached, beansHit := 0, false
-	s.beansMu.Lock()
-	if e, ok := s.beansCache[id]; ok && time.Since(e.at) < 60*time.Second {
-		beansCached, beansHit = e.val, true
-	}
-	s.beansMu.Unlock()
-
-	// 用 TryLock：长任务（保活 / 周常 / 云实验）持锁期间拿不到锁，
-	// 直接退回上次缓存，而不是把请求排到队列里干等。
-	//
-	// 【必须一次拿锁做完会话检查 + 取积分】
-	//
-	// 这里原来写的是两次独立的 withAccountTry：
-	//   第一次：SessionInfo()（读 cookies.json 判会话）
-	//   第二次：huawei.New("").Beans()（读同一份 cookies 取积分）
-	// 两次之间锁会释放，而 config.SetAccount 是**进程级全局变量**。
-	// 只要中间有别的 goroutine 拿了锁并把 accountID 改成 B，
-	// 第二次就会读 B 的 cookies，把 B 的积分记到 A 头上。
-	//
-	// 实测症状（2026-11-02）：面板上 4 个账号里有两个显示同一个
-	// 用户名 yd_260581878、同一份积分 430 —— 那就是串号。
-	// 用户一眼就看出「直接混乱了都」。
-	//
-	// 会话检查和积分都依赖 config.CookieFile()（= 全局 accountID），
-	// 所以它们必须在**同一次**持锁期间完成，不能拆开。
 	ok := s.withAccountTry(id, func() any {
 		info, err := task.SessionInfo()
 		if err != nil {
@@ -613,23 +585,6 @@ func (s *Server) probeAccountFull(id string) (bool, string, float64, int) {
 		if v, ok := info["auth_remaining_days"].(float64); ok {
 			remain = v
 		}
-		if !alive {
-			return nil
-		}
-		if beansHit {
-			beans = beansCached
-			return nil
-		}
-		// 2026-11-23：积分改从新版成长中心取（旧 bonus-beans 已下线）。
-		if gs, err := huawei.NewGrowSession(); err == nil {
-			if n, err := gs.Points(); err == nil {
-				beans = n
-				return nil
-			}
-		}
-		if sess, err := huawei.New(""); err == nil {
-			beans = sess.Beans()
-		}
 		return nil
 	})
 	if !ok {
@@ -640,10 +595,9 @@ func (s *Server) probeAccountFull(id string) (bool, string, float64, int) {
 		return false, "", 0, -1
 	}
 
-	if beans >= 0 && !beansHit {
-		s.beansMu.Lock()
-		s.beansCache[id] = beanEntry{val: beans, at: time.Now()}
-		s.beansMu.Unlock()
+	// 积分只读持久缓存（不联网）。
+	if e, hit := cachedPointsEntry(id); hit {
+		beans = e.Points
 	}
 	return alive, username, remain, beans
 }
@@ -903,6 +857,17 @@ func floatOf(v any) float64 {
 	return f
 }
 
+// intOf 把 any 安全转成 int；非数值（nil、缺失）返回 -1。
+func intOf(v any) int {
+	if f, ok := v.(float64); ok {
+		return int(f)
+	}
+	if i, ok := v.(int); ok {
+		return i
+	}
+	return -1
+}
+
 // handleCheckAccount 检查单个账号。
 func (s *Server) handleCheckAccount(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
@@ -940,13 +905,22 @@ func (s *Server) handleCheckAccount(w http.ResponseWriter, r *http.Request) {
 	if v, ok := info["auth_remaining_days"].(float64); ok {
 		out["remain_days"] = v
 	}
+	// 「检查」是显式操作：顺手现查一次新站积分并写缓存。
+	// 查不到不改缓存（保持上次的值），也不把失败当成错误返回 ——
+	// 检查按钮的主任务是会话状态，积分只是顺带。
+	if n, ok := refreshAccountBeans(id); ok {
+		out["beans"] = n
+	} else if e, ok := cachedPointsEntry(id); ok {
+		out["beans"] = e.Points
+		out["beans_stale"] = true
+	}
 	// 顺手更新探测缓存，账号卡片下次刷新能直接看到
 	s.probeMu.Lock()
 	s.probeCache[id] = probeSnapshot{
 		Alive:    boolOf(info["alive"]),
 		Username: strOf(info["username"]),
 		Remain:   floatOf(info["auth_remaining_days"]),
-		Beans:    -1,
+		Beans:    intOf(out["beans"]),
 		At:       time.Now(),
 	}
 	s.probeMu.Unlock()
@@ -1285,8 +1259,14 @@ func (s *Server) finishJob(jobID string, res map[string]any, errMsg string) {
 	}
 	s.jobMu.Unlock()
 
+	// 2026-11-23：任务结束后现查积分写持久缓存（显式更新时机）。
+	// 放 goroutine：finishJob 之后马上要发推送、前端也在轮询 /api/jobs，
+	// 别让一次积分查询（最多 25 秒超时）拖住任何一条路径。
 	if notifyInfo != nil {
-		go s.notifyJobDone(notifyInfo)
+		go func() {
+			s.refreshBeansAfterJob(notifyInfo)
+			go s.notifyJobDone(notifyInfo)
+		}()
 	}
 }
 
@@ -1467,11 +1447,11 @@ func (s *Server) pushBeanLines(n *jobNotify) (lines []beanLine, total int, anyOK
 	return lines, total, anyOK
 }
 
-// beansForNotify 只现查任务后的积分；失败显示未知，不回退到旧缓存。
+// beansForNotify 通知用的积分：优先现查（这是任务刚结束的显式时机），
+// 现查成功顺带写缓存；失败回读缓存，缓存也没有才显示未知。
 //
 // 2026-11-23 起优先走新版成长中心 /user/info 的 total_points。
-// 旧 devdata 积分接口已下线（403 not login），若新站取不到再尝试旧会话，
-// 两者都失败才标记「未知」。
+// 旧 devdata 积分接口已下线（403 not login），保留旧会话作最后兜底。
 func (s *Server) beansForNotify(id string) (int, bool) {
 	dir := filepath.Join(config.Root(), "accounts", id, "state")
 	if id == "" {
@@ -1479,13 +1459,20 @@ func (s *Server) beansForNotify(id string) (int, bool) {
 	}
 	if sess, err := newGrowNotifySession(dir); err == nil {
 		if n, err := sess.Points(); err == nil {
+			storePointsEntry(id, n)
 			return n, true
 		}
 	}
 	if sess, err := newNotifySession(dir); err == nil {
 		if n, err := sess.BeansE(); err == nil {
+			storePointsEntry(id, n)
 			return n, true
 		}
+	}
+	// 两条现查路径都失败（会话抖动/网络问题）：回读持久缓存，
+	// 推送里显示的是最近的积分，比「未知」有用。
+	if e, ok := cachedPointsEntry(id); ok {
+		return e.Points, true
 	}
 	return 0, false
 }
@@ -1801,6 +1788,13 @@ func (s *Server) startBatchJob(name string) (*jobState, error) {
 			results = append(results, ar)
 
 			svcLog("[batch] %s %s → ok=%v %s", jobID, label, ar.OK, clipStr(ar.Msg, 120))
+
+			// 2026-11-23：每个账号跑完后现查积分写缓存（显式更新时机）。
+			// keepalive 不产积分，跳过。
+			if name != "keepalive" {
+				refreshAccountBeans(acc.ID)
+			}
+
 			// 账号之间留间隔，避免连续请求触发风控。保活很快，间隔小一点。
 			if idx < len(list)-1 {
 				gap := 8 * time.Second
@@ -2211,10 +2205,10 @@ func (s *Server) handleRunTask(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if name == "beans" {
-			// 2026-11-23：积分改从新版成长中心取（旧 bonus-beans 已下线）。
-			// 必须用**账号目录**构造会话：这里是绕过全局锁的查询分支，
-			// config.SetAccount 的进程级全局值可能还停在上一个账号上，
-			// 用 NewGrowSession() 会读到别人的 cookie（串号）或空路径（报未登录）。
+			// 2026-11-23：用户点「积分」是**显式操作**，此刻现查新站并写缓存。
+			// 用账号目录构造会话（不碰进程级全局 accountID，见 tasks 分支说明）。
+			// 查询失败时回读缓存：缓存有值就显示缓存值并标 stale，
+			// 没有缓存才报错 —— 避免会话抖动让面板积分直接消失。
 			gs, gerr := huawei.NewGrowSessionForAccount(stateDir)
 			if gerr != nil {
 				writeJSON(w, map[string]any{"error": "读取会话失败：" + gerr.Error()})
@@ -2222,12 +2216,20 @@ func (s *Server) handleRunTask(w http.ResponseWriter, r *http.Request) {
 			}
 			n, perr := gs.Points()
 			if perr != nil {
+				if e, ok := cachedPointsEntry(id); ok {
+					writeJSON(w, map[string]any{
+						"beans":    e.Points,
+						"username": "",
+						"stale":    true,
+						"cached_at": e.At.Format("2006-01-02 15:04"),
+						"msg":      "现查失败（" + perr.Error() + "），显示 " + e.At.Format("01-02 15:04") + " 的缓存值",
+					})
+					return
+				}
 				writeJSON(w, map[string]any{"error": "读取新版成长中心积分失败：" + perr.Error()})
 				return
 			}
-			s.beansMu.Lock()
-			s.beansCache[id] = beanEntry{val: n, at: time.Now()}
-			s.beansMu.Unlock()
+			storePointsEntry(id, n)
 			uname := ""
 			if u, uerr := gs.UserInfo(); uerr == nil {
 				uname = u.DomainName
@@ -2643,6 +2645,13 @@ func (s *Server) handleRunTask(w http.ResponseWriter, r *http.Request) {
 	// 任务后刷新状态
 	alive, username, remain := s.probeAccount(id)
 	s.store.MarkChecked(id, alive, username, remain, "")
+
+	// 2026-11-23：做完任务后现查一次积分写缓存（显式更新时机）。
+	// 只对「产积分」的任务查：查询/工具类（tasks/beans/session/check/...）
+	// 不产积分，查了也是原值。失败不报错 —— 缓存保持旧值即可。
+	if pushWorthyTask(name) {
+		refreshAccountBeans(id)
+	}
 
 	_ = acc
 	writeJSON(w, result)
@@ -3993,6 +4002,13 @@ func RunBatchForCLI(name string) (result map[string]any) {
 		}
 		results = append(results, ar)
 		svcLog("[batch-cli] %s → ok=%v %s", label, ar.OK, clipStr(ar.Msg, 100))
+
+		// 2026-11-23：每个账号跑完后现查积分写缓存（显式更新时机）。
+		// CLI 是独立进程，写进 points_cache.json 后面板进程直接能读到新值。
+		// keepalive 不产积分，跳过。
+		if name != "keepalive" {
+			refreshAccountBeans(acc.ID)
+		}
 
 		if i < len(list)-1 {
 			gap := 8

@@ -61,6 +61,10 @@ func (s *Server) growSign() (map[string]any, error) {
 	out := map[string]any{
 		"total_points": u.TotalPoints,
 	}
+	// user/info 自带总分，顺手写持久缓存（免费更新时机）。
+	if u.TotalPoints > 0 {
+		storePointsEntry(config.AccountID(), u.TotalPoints)
+	}
 	// 签到状态以任务清单里的 daily_login 为准。
 	// /user/info 没有 signed 字段（实测 keys 里不含），拿它判断恒为未签到，
 	// 会导致每次点签到都去撞一次接口、页面也永远显示「未签到」。
@@ -79,6 +83,10 @@ func (s *Server) growSign() (map[string]any, error) {
 	out["result"] = r
 	out["signed"] = r.Signed
 	out["total_points"] = r.TotalPoints
+	// 2026-11-23：签到响应自带最新总分，免费拿到 —— 顺手写持久缓存。
+	if r.TotalPoints > 0 {
+		storePointsEntry(config.AccountID(), r.TotalPoints)
+	}
 	if r.Signed {
 		out["msg"] = fmt.Sprintf("签到成功 +%d", r.Points)
 	} else {
@@ -97,6 +105,7 @@ func (s *Server) growPoints() (int, bool) {
 	if err != nil {
 		return 0, false
 	}
+	storePointsEntry(config.AccountID(), n)
 	return n, true
 }
 
