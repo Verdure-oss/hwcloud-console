@@ -4428,6 +4428,11 @@ issueStep:
 		steps = append(steps, map[string]any{"name": "Star Grape", "ok": true, "msg": "已 Star " + fmt.Sprint(res["repo"]), "detail": res})
 	} else {
 		msg, _ := res["msg"].(string)
+		// 没绑 GitHub 时这一步只能人工（绑定 + 点 Star 都在 GitHub 侧）。
+		// 标 need_manual，避免周常把它算成失败而每周误报。
+		if needBind, _ := res["need_bind"].(bool); needBind {
+			res["need_manual"] = true
+		}
 		svcLog("[weekly] Star Grape 未完成: %s", msg)
 		steps = append(steps, map[string]any{"name": "Star Grape", "ok": false, "msg": msg, "detail": res})
 	}
@@ -4525,7 +4530,11 @@ issueStep:
 		steps = append(steps, map[string]any{"name": "ICT创新赛", "ok": true, "msg": "已处理", "detail": res})
 	} else {
 		msg, _ := res["msg"].(string)
-		svcLog("[weekly] ICT 创新赛未完成: %s", msg)
+		// ICT 创新赛的第 2/3 步（实名认证、授权领取）只能人工完成，
+		// 自动化到此为止。带上 need_manual，让 summarizeSteps 归入
+		// 「待人工」而不是「失败」，否则周常每周固定误报 task_fail。
+		res["need_manual"] = true
+		svcLog("[weekly] ICT 创新赛未完成（需人工）: %s", msg)
 		steps = append(steps, map[string]any{"name": "ICT创新赛", "ok": false, "msg": msg, "detail": res})
 	}
 
@@ -4552,22 +4561,52 @@ func (s *Server) weeklyMissionDone(kw string) bool {
 }
 
 // summarizeSteps 把多步执行结果汇总成一句话 + 明细。
+//
+// 「待人工」与「失败」必须分开统计：
+// 新清单里 ICT 创新赛要实名认证、Grape Star 要绑 GitHub，这类步骤
+// 自动化只能如实回报卡点，永远不可能返回 ok=true。若把它们算失败，
+// 周常会每周固定报「失败」并推 task_fail —— 用户看到的是红叉，
+// 但实际该做的自动化步骤全做完了，属于误报。
 func summarizeSteps(label string, steps []map[string]any) map[string]any {
-	okN, failN := 0, 0
+	okN, failN, manualN := 0, 0, 0
 	for _, st := range steps {
 		if b, _ := st["ok"].(bool); b {
 			okN++
-		} else {
-			failN++
+			continue
+		}
+		if m, _ := st["manual"].(bool); m || needsManual(st) {
+			manualN++
+			continue
+		}
+		failN++
+	}
+	msg := fmt.Sprintf("%s：成功 %d", label, okN)
+	if manualN > 0 {
+		msg += fmt.Sprintf("，待人工 %d", manualN)
+	}
+	if failN > 0 {
+		msg += fmt.Sprintf("，失败 %d", failN)
+	}
+	return map[string]any{
+		"ok":     failN == 0,
+		"label":  label,
+		"msg":    msg,
+		"manual": manualN > 0,
+		"steps":  steps,
+	}
+}
+
+// needsManual 判断某步是否属于「必须人去页面上做」的卡点。
+//
+// 判据用步骤自带的 detail 里由 task 层显式给出的 need_manual，
+// 不做关键词猜测 —— 之前用字符串匹配标题/文案，误伤过正常失败。
+func needsManual(st map[string]any) bool {
+	if d, ok := st["detail"].(map[string]any); ok {
+		if v, ok := d["need_manual"].(bool); ok && v {
+			return true
 		}
 	}
-	msg := fmt.Sprintf("%s：成功 %d，失败 %d", label, okN, failN)
-	return map[string]any{
-		"ok":    failN == 0,
-		"label": label,
-		"msg":   msg,
-		"steps": steps,
-	}
+	return false
 }
 
 // handleGitCodeCreds 设置账号的 GitCode 账密。

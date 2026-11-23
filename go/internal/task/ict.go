@@ -99,13 +99,17 @@ func ICTInnovationStatus(headless bool) (map[string]any, error) {
 			out["msg"] = "ICT 页面已登录；实名认证 / 授权领取需人工在页面完成"
 		default:
 			out["step_hint"] = "登录已就绪"
+			// 报名/提交同样只能人工，这一步自动化到不了终点。
+			out["need_manual"] = true
 			out["msg"] = "ICT 页面已登录；报名需在页面继续操作"
 		}
 	case strings.Contains(txt, "立即登录"):
 		out["logged_in"] = false
 		out["need_login"] = true
+		out["need_manual"] = true
 		out["msg"] = "ICT 页面需要先用 gallery 成员会话登录华为云（与成长中心会话独立）"
 	default:
+		out["need_manual"] = true
 		out["msg"] = "ICT 页面状态无法识别，已记录页面文本"
 	}
 	return out, nil
