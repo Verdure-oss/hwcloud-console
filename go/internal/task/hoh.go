@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
 	"strings"
 
 	"hwcloud/internal/huawei"
@@ -156,37 +155,36 @@ func HohBind(gitcodeUser string) (map[string]any, error) {
 	return out, nil
 }
 
-// HohTaskStatus 读取实践中心首页里各任务卡片的完成状态。
+// HohTaskStatus 返回实践中心的账号绑定事实（GitHub / GitCode 是否已绑定）。
 //
-// 为什么需要它：成长中心（grow）和个人任务列表的 is_finish 依赖激励服务
-// 异步结算，可能滞后；而实践中心首页是任务执行侧自己渲染的状态，
-// 对「Star Grape」「Star 实践中心代码仓」这类任务是更及时的证据。
+// 2026-11-23 修正（重要）：这里原来靠正则匹配卡片里的「已完成」文字，
+// 但实测那是**静态模板**，不是真实状态：
+//   - CSS `.task-status { display: none }` 默认全隐藏；
+//   - 前端 renderTask() 明确写 `card.classList.remove('task-done')`，
+//     注释是「始终不限制、不锁定、不计数」。
+// 也就是说页面 HTML 里所有卡片都硬编码着「已完成」，服务端从不渲染状态。
+// 旧实现因此对每个账号都返回 taskGrapeStar=true / taskStar=true /
+// taskIssue=true —— 全假阳性，会让上层把没做的任务当成已完成而跳过。
 //
-// 返回 map[taskID]finished，taskID 形如 taskGrapeStar / taskStar / taskIssue。
+// 现在只报**能够证实的**状态：GitHub 绑定态走 /api/github/status，
+// GitCode 绑定态走 /api/binding/status；任务完成与否以成长中心
+// /user/tasks 的 is_finish 为准（由激励服务异步结算）。
 func HohTaskStatus() (map[string]bool, error) {
 	session, err := huawei.New("")
 	if err != nil {
 		return nil, err
 	}
-	data, err := hohRequest(session, http.MethodGet, "/", nil)
-	if err != nil {
-		return nil, err
-	}
-	html := string(data)
 	out := map[string]bool{}
-	// 每个卡片形如：id="taskGrapeStar" ... <div class="task-status">...已完成</div>
-	re := regexp.MustCompile(`(?s)id="(task[A-Za-z]+)".*?class="task-status"[^>]*>(.*?)</div>`)
-	for _, m := range re.FindAllStringSubmatch(html, -1) {
-		id := m[1]
-		text := stripTags(m[2])
-		out[id] = strings.Contains(text, "已完成")
+	if gh, err := hohGitHubStatus(session); err == nil {
+		out["githubBound"] = gh.HasGitHub
+	}
+	if b, err := hohBindingStatus(session); err == nil {
+		out["gitcodeBound"] = b.GitCodeBound
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("实践中心状态不可用（绑定接口均失败）")
 	}
 	return out, nil
-}
-
-// stripTags 去掉 HTML 标签，保留文本。
-func stripTags(s string) string {
-	return regexp.MustCompile(`<[^>]+>`).ReplaceAllString(s, "")
 }
 func TrackDevSpace() (map[string]any, error) {
 	session, err := huawei.New("")

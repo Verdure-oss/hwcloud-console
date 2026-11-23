@@ -43,20 +43,26 @@ func StarGrapeRepo(headless bool) (map[string]any, error) {
 	}
 	out := map[string]any{"repo": owner + "/" + name, "url": repo, "ok": false}
 
-	// 1. 实践中心页面状态（最及时）
-	if st, err := HohTaskStatus(); err == nil {
-		out["hoh_status"] = st
-		if st["taskGrapeStar"] {
-			out["ok"] = true
-			out["msg"] = "实践中心已显示 Grape Star 已完成"
-			return out, nil
+	// 1. 成长中心任务完成态（唯一权威来源；实践中心页面不渲染完成状态）
+	if gs, gerr := huawei.NewGrowSession(); gerr == nil {
+		if tasks, terr := gs.Tasks(); terr == nil {
+			for _, t := range tasks {
+				if t.TaskTag == huawei.TagGrapeOpenSource {
+					out["grow_finished"] = t.Finished()
+					if t.Finished() {
+						out["ok"] = true
+						out["msg"] = "成长中心已显示 Grape Star 已完成"
+						return out, nil
+					}
+				}
+			}
 		}
 	}
 
-	// 2. GitHub 是否已绑定（实践中心绑定面板）
+	// 2. GitHub 是否已绑定（实践中心 /api/github/status）
 	bound := false
 	if session, serr := huawei.New(""); serr == nil {
-		if b, berr := hohBindingStatus(session); berr == nil {
+		if b, berr := hohGitHubStatus(session); berr == nil {
 			bound = b.HasGitHub
 			out["github_bound"] = bound
 			out["github_user"] = b.GitHubLogin
@@ -68,9 +74,9 @@ func StarGrapeRepo(headless bool) (map[string]any, error) {
 		return out, nil
 	}
 
-	// 3. 已绑定但页面仍未完成：如实报告需要人工 Star（本项目无 GitHub 登录态）
+	// 3. 已绑定但成长中心仍未结算：如实报告需要人工 Star
 	out["need_manual"] = true
-	out["msg"] = "GitHub 已绑定，但实践中心尚未显示完成；需要在 GitHub 对 " + owner + "/" + name + " 点 Star"
+	out["msg"] = "GitHub 已绑定，但成长中心尚未显示完成；需要在 GitHub 对 " + owner + "/" + name + " 点 Star（结算有延迟）"
 	return out, nil
 }
 
@@ -91,8 +97,34 @@ func parseGitHubRepo(s string) (string, string, error) {
 
 // hohBinding 是实践中心的账号绑定状态。
 type hohBinding struct {
-	HasGitHub   bool
-	GitHubLogin string
+	GitCodeBound bool
+	GitCodeLogin string
+	HasGitHub    bool
+	GitHubLogin  string
+}
+
+// hohGitHubStatus 读实践中心的 GitHub 绑定状态（只读）。
+//
+// 这是 Grape Star 任务的真实前置条件：页面上的 GitCode/GitHub 卡片
+// 不会渲染完成态，绑定与否只能从这个接口取。
+func hohGitHubStatus(session *huawei.Session) (hohBinding, error) {
+	var out hohBinding
+	body, err := hohRequest(session, http.MethodGet, "/api/github/status", nil)
+	if err != nil {
+		return out, err
+	}
+	var resp struct {
+		Bound bool    `json:"bound"`
+		User  *string `json:"user"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return out, err
+	}
+	out.HasGitHub = resp.Bound
+	if resp.User != nil {
+		out.GitHubLogin = *resp.User
+	}
+	return out, nil
 }
 
 // hohBindingStatus 读实践中心绑定状态（只读）。
@@ -107,6 +139,7 @@ func hohBindingStatus(session *huawei.Session) (hohBinding, error) {
 		return out, err
 	}
 	var resp struct {
+		Bound    bool `json:"bound"`
 		Bindings []struct {
 			Provider string `json:"provider"`
 			Login    string `json:"login"`
@@ -116,8 +149,16 @@ func hohBindingStatus(session *huawei.Session) (hohBinding, error) {
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return out, err
 	}
+	out.GitCodeBound = resp.Bound
 	for _, b := range resp.Bindings {
-		if b.Provider == "github" && b.Status == "bound" {
+		if b.Status != "bound" {
+			continue
+		}
+		switch b.Provider {
+		case "gitcode":
+			out.GitCodeBound = true
+			out.GitCodeLogin = b.Login
+		case "github":
 			out.HasGitHub = true
 			out.GitHubLogin = b.Login
 		}
