@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -74,6 +73,17 @@ func parseStars(s string) []int {
 		out = []int{1, 2}
 	}
 	return out
+}
+
+// signLabel 把签到状态转成中文（check 子命令用）。
+func signLabel(signed bool, err error) string {
+	if err != nil {
+		return "签到状态未知"
+	}
+	if signed {
+		return "今日已签到"
+	}
+	return "今日未签到"
 }
 
 func resolve(path, base string) string {
@@ -389,84 +399,110 @@ func Main(args []string) int {
 		return 0
 
 	case "check":
+		// 2026-11-23：旧 devdata 的任务接口已下线（404 / 403 not login），
+		// 改报新版成长中心的账号状态 + 任务进度。
 		fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
-		stars := fs.String("stars", "1,2", "任务星级，例如 1,2")
+		stars := fs.String("stars", "1,2", "（已废弃，新平台无星级概念）")
+		_ = stars
 		if err := fs.Parse(rest); err != nil {
 			return 2
 		}
 		ensureSession()
-		session, err := huawei.New("")
+		gs, err := huawei.NewGrowSession()
 		if err != nil {
 			return fail(err)
 		}
-		summary, err := huawei.Summarize(session, parseStars(*stars)...)
+		u, err := gs.UserInfo()
 		if err != nil {
 			return fail(err)
 		}
-		fmt.Println(huawei.FormatSummary(summary))
+		tasks, terr := gs.Tasks()
+		if terr != nil {
+			return fail(terr)
+		}
+		done := 0
+		for _, t := range tasks {
+			if t.Finished() {
+				done++
+			}
+		}
+		signed, serr := gs.SignedToday()
+		fmt.Printf("[+] 登录态有效：%s（%d 积分，%s）\n", u.DomainName, u.TotalPoints, signLabel(signed, serr))
+		fmt.Printf("    任务进度：%d/%d 已完成\n", done, len(tasks))
 		return 0
 
 	case "sign":
+		// 2026-11-23：签到改走新版成长中心 /user/sign-in。
 		ensureSession()
-		session, err := huawei.New("")
+		gs, err := huawei.NewGrowSession()
 		if err != nil {
 			return fail(err)
 		}
-		already, err := session.AutoSign()
+		u, err := gs.UserInfo()
 		if err != nil {
 			return fail(err)
 		}
-		if already {
-			fmt.Println("今日已签到，无需重复签到")
-		} else {
-			fmt.Println("签到成功")
+		// 签到状态以 daily_login 任务为准（/user/info 没有 signed 字段）。
+		if done, serr := gs.SignedToday(); serr == nil && done {
+			fmt.Printf("今日已签到（%d 积分）\n", u.TotalPoints)
+			return 0
 		}
-		return 0
+		r, err := gs.SignIn()
+		if err != nil {
+			return fail(err)
+		}
+		if r.Signed {
+			fmt.Printf("签到成功 +%d（共 %d 积分）\n", r.Points, r.TotalPoints)
+			return 0
+		}
+		return fail(fmt.Errorf("签到未生效：%+v", r))
 
 	case "tasks":
+		// 2026-11-23：任务清单改走新版成长中心。
 		fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
-		stars := fs.String("stars", "1,2", "任务星级，例如 1,2")
 		asJSON := fs.Bool("json", false, "输出原始 JSON（含 url / 描述等字段）")
 		if err := fs.Parse(rest); err != nil {
 			return 2
 		}
 		ensureSession()
-		session, err := huawei.New("")
+		gs, err := huawei.NewGrowSession()
 		if err != nil {
 			return fail(err)
 		}
-		missions, err := huawei.TasksByStar(session, parseStars(*stars)...)
+		tasks, err := gs.Tasks()
 		if err != nil {
 			return fail(err)
 		}
 		if *asJSON {
-			printJSON(missions)
+			printJSON(tasks)
 			return 0
 		}
-		degrees := map[int]bool{}
-		for _, m := range missions {
-			degrees[m.Degree] = true
-		}
-		var ordered []int
-		for d := range degrees {
-			ordered = append(ordered, d)
-		}
-		sort.Ints(ordered)
-		for _, d := range ordered {
-			label := huawei.StarLabel[d]
-			if label == "" {
-				label = fmt.Sprintf("%d星", d)
-			}
-			fmt.Printf("%s:\n", label)
-			for _, m := range missions {
-				if m.Degree != d {
+		// 按周期分组输出，周期内保持服务端顺序。
+		order := []string{"DAILY", "WEEKLY", "MONTHLY", "LIMIT"}
+		labels := map[string]string{"DAILY": "每日", "WEEKLY": "每周", "MONTHLY": "每月", "LIMIT": "一次性"}
+		for _, cyc := range order {
+			printed := false
+			for _, t := range tasks {
+				if strings.ToUpper(t.CycleType) != cyc {
 					continue
 				}
+				if !printed {
+					fmt.Printf("%s:\n", labels[cyc])
+					printed = true
+				}
 				mark := "未完成"
-				if m.IsFinish == 1 {
+				if t.Finished() {
 					mark = "已完成"
 				}
-				fmt.Printf("  [%s] %s (+%d)\n", mark, m.Title, m.Bonus)
+				extra := ""
+				if t.TaskLimit != nil && *t.TaskLimit > 0 {
+					n := 0
+					if t.CompletedTimes != nil {
+						n = *t.CompletedTimes
+					}
+					extra = fmt.Sprintf(" %d/%d", n, *t.TaskLimit)
+				}
+				fmt.Printf("  [%s] %s (+%d)%s\n", mark, t.Title, t.Points, extra)
 			}
 		}
 		return 0

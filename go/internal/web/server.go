@@ -2207,16 +2207,28 @@ func (s *Server) handleRunTask(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if name == "beans" {
-			n, err := sess.BeansE()
-			if err != nil {
-				writeJSON(w, map[string]any{"error": err.Error()})
+			// 2026-11-23：积分改从新版成长中心取（旧 bonus-beans 已下线）。
+			// 必须用**账号目录**构造会话：这里是绕过全局锁的查询分支，
+			// config.SetAccount 的进程级全局值可能还停在上一个账号上，
+			// 用 NewGrowSession() 会读到别人的 cookie（串号）或空路径（报未登录）。
+			gs, gerr := huawei.NewGrowSessionForAccount(stateDir)
+			if gerr != nil {
+				writeJSON(w, map[string]any{"error": "读取会话失败：" + gerr.Error()})
 				return
 			}
-			// 顺手更新缓存，面板卡片下次刷新就能看到新积分
+			n, perr := gs.Points()
+			if perr != nil {
+				writeJSON(w, map[string]any{"error": "读取新版成长中心积分失败：" + perr.Error()})
+				return
+			}
 			s.beansMu.Lock()
 			s.beansCache[id] = beanEntry{val: n, at: time.Now()}
 			s.beansMu.Unlock()
-			writeJSON(w, map[string]any{"beans": n, "username": sess.Username})
+			uname := ""
+			if u, uerr := gs.UserInfo(); uerr == nil {
+				uname = u.DomainName
+			}
+			writeJSON(w, map[string]any{"beans": n, "username": uname})
 			return
 		}
 
@@ -2230,36 +2242,73 @@ func (s *Server) handleRunTask(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		missions, err := huawei.TasksByStar(sess, 1, 2, 3, 4, 5)
-		if err != nil {
-			writeJSON(w, map[string]any{"error": err.Error()})
+		// 2026-11-23：任务列表改走新版成长中心。
+		// 旧 devdata 的 TasksByStar 已下线，会返回空列表 → 面板显示「没有任务」。
+		//
+		// 这里必须用 NewGrowSessionForAccount(stateDir)，不能用 NewGrowSession()：
+		// 本分支刻意不拿全局锁、也不调 config.SetAccount，全局 accountID
+		// 还停在上一个任务的值上。早先就是因此读到别的账号（或空）cookie，
+		// Tasks() 返回未登录错误后被静默吞掉，落回旧接口得到空列表。
+		if gs, gerr := huawei.NewGrowSessionForAccount(stateDir); gerr == nil {
+			if tasks, terr := gs.Tasks(); terr == nil {
+				list := make([]map[string]any, 0, len(tasks))
+				for _, t := range tasks {
+					done := t.Finished()
+					completed := 0
+					if t.CompletedTimes != nil {
+						completed = *t.CompletedTimes
+					}
+					limit := 0
+					if t.TaskLimit != nil {
+						limit = *t.TaskLimit
+					}
+					list = append(list, map[string]any{
+						"title":        t.Title,
+						"tag":          t.TaskTag,
+						"cycle":        t.CycleType,
+						"degree":       cycleDegree(t.CycleType),
+						"bonus":        t.Points,
+						"done":         done,
+						"times":        completed,
+						"limit":        limit,
+						"url":          t.URL,
+						"description":  t.Description,
+						"category":     t.CategoryName,
+					})
+				}
+				writeJSON(w, map[string]any{"tasks": list, "backend": "grow-new"})
+				return
+			} else {
+				// 旧接口已下线，不要再拿它兜底：TasksByStar 返回空列表会让
+				// 前端显示「没有任务」，把会话问题伪装成「这个号没任务」。
+				writeJSON(w, map[string]any{
+					"error":   "读取新版成长中心任务失败：" + terr.Error(),
+					"backend": "grow-new",
+				})
+				return
+			}
+		} else {
+			writeJSON(w, map[string]any{
+				"error": "读取会话失败：" + gerr.Error(),
+				"backend": "grow-new",
+			})
 			return
 		}
-		list := make([]map[string]any, 0, len(missions))
-		for _, m := range missions {
-			list = append(list, map[string]any{
-				"title":  m.Title,
-				"degree": m.Degree,
-				"bonus":  m.Bonus,
-				"done":   m.IsFinish == 1,
-			})
-		}
-		writeJSON(w, map[string]any{"tasks": list})
-		return
 	}
 
 	result := s.withAccount(id, func() any {
 		switch name {
 		case "sign":
-			sess, err := huawei.New("")
+			// 2026-11-23：签到改走新版成长中心。
+			// 旧 devdata 的 AutoSign 已下线：查询阶段就返回 HTTP 500
+			// `The sign-in behavior is bound to more than one mission.`，
+			// 面板点「签到」永远报错。新站 /user/sign-in 幂等，重复点无副作用。
+			res, err := s.growSign()
 			if err != nil {
 				return map[string]any{"error": err.Error()}
 			}
-			already, err := sess.AutoSign()
-			if err != nil {
-				return map[string]any{"error": err.Error()}
-			}
-			return map[string]any{"already_signed": already}
+			res["already_signed"] = res["already"] == true || res["signed"] == true
+			return res
 
 		case "devspace":
 			res, err := task.TrackDevSpace()

@@ -60,12 +60,17 @@ func (s *Server) growSign() (map[string]any, error) {
 	}
 	out := map[string]any{
 		"total_points": u.TotalPoints,
-		"signed":       u.Signed,
 	}
-	if u.Signed {
-		out["already"] = true
-		out["msg"] = "今日已签到"
-		return out, nil
+	// 签到状态以任务清单里的 daily_login 为准。
+	// /user/info 没有 signed 字段（实测 keys 里不含），拿它判断恒为未签到，
+	// 会导致每次点签到都去撞一次接口、页面也永远显示「未签到」。
+	if done, serr := sess.SignedToday(); serr == nil {
+		out["signed"] = done
+		if done {
+			out["already"] = true
+			out["msg"] = "今日已签到"
+			return out, nil
+		}
 	}
 	r, err := sess.SignIn()
 	if err != nil {
@@ -212,6 +217,22 @@ func hasGrowTaskLike(st growTaskState, excludeTags []string, keywords ...string)
 		}
 	}
 	return false
+}
+
+// cycleDegree 把新站周期映射成面板原来的「星级」展示（兼容旧前端）。
+// 新平台没有星级概念，这里按积分档位给个近似值，仅用于排序/展示。
+func cycleDegree(cycle string) int {
+	switch strings.ToUpper(cycle) {
+	case "DAILY":
+		return 1
+	case "WEEKLY":
+		return 2
+	case "MONTHLY":
+		return 3
+	case "LIMIT":
+		return 4
+	}
+	return 1
 }
 
 // growStateDir 返回当前账号的 state 目录（给日志/调试用）。

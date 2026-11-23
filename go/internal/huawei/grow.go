@@ -371,6 +371,26 @@ func (s *GrowSession) Points() (int, error) {
 	return u.TotalPoints, nil
 }
 
+// SignedToday 判断今日是否已签到。
+//
+// 不能用 /user/info 的 signed 字段：2026-11-23 实测该接口根本不返回
+// signed（keys 只有 id / domain_id / domain_name / total_points /
+// user_type / created_at / updated_at 等），Go 反序列化后永远是 false。
+// 平台自己给出的权威判据是任务清单里的 daily_login 任务是否已完成。
+func (s *GrowSession) SignedToday() (bool, error) {
+	tasks, err := s.Tasks()
+	if err != nil {
+		return false, err
+	}
+	for _, t := range tasks {
+		if t.TaskTag == TagDailyLogin {
+			return t.Finished(), nil
+		}
+	}
+	// 任务清单里没有签到项：退化为「不知道」，由调用方决定是否尝试签到。
+	return false, fmt.Errorf("任务清单中没有 %s 项", TagDailyLogin)
+}
+
 // publicTasks 拉公共任务清单（不需要登录）。仅用于做映射/排查。
 func (s *GrowSession) publicTasks() ([]GrowTask, error) {
 	req, err := http.NewRequest(http.MethodGet, GrowAPIBase+"/servlet/tasks?show=true&biz_type=opc&page_no=1&page_size=100", nil)
