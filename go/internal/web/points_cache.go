@@ -37,7 +37,15 @@ type pointsEntry struct {
 var (
 	pointsCacheMu sync.Mutex
 	pointsCache   map[string]pointsEntry
-	pointsLoaded  bool
+	// lastDiskRead 记录上次从磁盘加载的时间。
+	//
+	// 【为什么不能只在进程启动时读一次】实测踩过（2026-11-24）：
+	// 缓存文件是跨进程共享的 —— 面板进程 20:48 读过一次盘后 pointsLoaded
+	// 恒为 true，第二天早上 CLI 定时任务把文件更新成 1080 分，
+	// 面板却还显示内存里的 1000 分，用户看到推送 1080、面板 1000。
+	// 现在按 mtime 判断：文件变了就重读，文件没变就读内存（零成本）。
+	lastDiskRead  time.Time
+	lastDiskMtime time.Time
 )
 
 // pointsCachePathOverride 仅供测试使用：测试不能碰 config.Root()，
@@ -54,18 +62,45 @@ func pointsCachePath() string {
 }
 
 // loadPointsCacheLocked 从磁盘加载缓存（调用方必须已持锁）。
+//
+// 每次读操作都会走到这里，但不会每次都真读盘：
+// 先 stat 文件 mtime，和上次加载时一样就直接用内存（列表 45 秒轮询
+// 全走内存，stat 一次的开销可以忽略）；mtime 变了才重读。
+// 这样 CLI 进程更新文件后面板下次轮询立刻能看到新值，
+// 同时避免每次轮询都做无谓的文件读取。
+//
 // 文件不存在/损坏都按空缓存处理 —— 缓存丢了只是多一次显式查询，不是错误。
 func loadPointsCacheLocked() {
-	if pointsLoaded {
+	// 内存缓存必须保证非 nil。
+	if pointsCache == nil {
+		pointsCache = map[string]pointsEntry{}
+	}
+	path := pointsCachePath()
+	st, err := os.Stat(path)
+	if err != nil {
+		// 文件不存在：清空内存缓存（比如测试隔离、文件被删）。
+		// 只在「上次加载成功过」后才清 —— 首次调用时内存本来就是空的。
+		if !lastDiskRead.IsZero() {
+			pointsCache = map[string]pointsEntry{}
+			lastDiskRead = time.Now()
+			lastDiskMtime = time.Time{}
+		}
 		return
 	}
-	pointsLoaded = true
-	pointsCache = map[string]pointsEntry{}
-	data, err := os.ReadFile(pointsCachePath())
+	if !lastDiskRead.IsZero() && st.ModTime().Equal(lastDiskMtime) {
+		return // 文件没变，内存即最新
+	}
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return
 	}
-	_ = json.Unmarshal(data, &pointsCache)
+	fresh := map[string]pointsEntry{}
+	if err := json.Unmarshal(data, &fresh); err != nil {
+		return // 损坏的文件不覆盖内存里的有效值
+	}
+	pointsCache = fresh
+	lastDiskRead = time.Now()
+	lastDiskMtime = st.ModTime()
 }
 
 // cachedPointsEntry 读某账号的缓存积分。只读，不发任何网络请求、不碰锁。
@@ -81,13 +116,37 @@ func cachedPointsEntry(id string) (pointsEntry, bool) {
 }
 
 // storePointsEntry 写缓存：先更内存，再原子落盘。
+//
+// 注意写路径直接更新内存并记录 mtime —— 不经过 loadPointsCacheLocked
+// 的「重读」分支，避免自己刚写的文件被当作「外部变更」再读一遍。
+// 但在写之前要先同步一次磁盘状态：如果 CLI 进程刚更新过文件，
+// 内存里还是旧值，直接覆盖写会把别的账号的新积分抹掉。
+// stat 一次拿到最新 mtime → 需要时重读 → 再合并写入。
 // 落盘失败只记日志 —— 缓存写不进去无非是下次重启后显示旧值，不影响业务。
 func storePointsEntry(id string, n int) {
 	if id == "" || id == batchAllID || n < 0 {
 		return
 	}
 	pointsCacheMu.Lock()
-	loadPointsCacheLocked()
+	// 内存缓存必须先保证非 nil（首次写入时文件还不存在，
+	// 下面的 stat 分支不会初始化它，直接赋值会 panic nil map）。
+	if pointsCache == nil {
+		pointsCache = map[string]pointsEntry{}
+	}
+	// 再吸收磁盘上的最新状态（别的进程可能刚写过）
+	if st, err := os.Stat(pointsCachePath()); err == nil {
+		if lastDiskRead.IsZero() || !st.ModTime().Equal(lastDiskMtime) {
+			if data, err := os.ReadFile(pointsCachePath()); err == nil {
+				fresh := map[string]pointsEntry{}
+				if json.Unmarshal(data, &fresh) == nil {
+					pointsCache = fresh
+					pointsCache[id] = pointsEntry{Points: n, At: time.Now()}
+				}
+			}
+			lastDiskRead = time.Now()
+			lastDiskMtime = st.ModTime()
+		}
+	}
 	pointsCache[id] = pointsEntry{Points: n, At: time.Now()}
 	data, err := json.MarshalIndent(pointsCache, "", "  ")
 	pointsCacheMu.Unlock()

@@ -31,16 +31,17 @@ func TestNotificationRegression(t *testing.T) {
 	t.Setenv("HWCLOUD_HOME", home)
 	// 隔离持久积分缓存：beansForNotify 现查失败时会回读 points_cache.json，
 	// 不清掉的话别的测试（或真实 HWCLOUD_HOME）留下的缓存会泄进断言。
-	pointsCacheMu.Lock()
-	pointsCache = nil
-	pointsLoaded = false
-	pointsCacheMu.Unlock()
-	t.Cleanup(func() {
+	resetPointsCache := func() {
 		pointsCacheMu.Lock()
 		pointsCache = nil
-		pointsLoaded = false
+		lastDiskRead = time.Time{}
+		lastDiskMtime = time.Time{}
 		pointsCacheMu.Unlock()
-	})
+	}
+	pointsCachePathOverride = filepath.Join(t.TempDir(), "points_cache.json")
+	t.Cleanup(func() { pointsCachePathOverride = "" })
+	resetPointsCache()
+	t.Cleanup(resetPointsCache)
 	for _, id := range []string{"fake-a", "fake-b"} {
 		dir := filepath.Join(home, "accounts", id)
 		os.MkdirAll(filepath.Join(dir, "state"), 0700)
