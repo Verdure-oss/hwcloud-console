@@ -330,8 +330,37 @@ func (s *GrowSession) UserInfoAt(base string) (*GrowUser, error) {
 }
 
 // Tasks 拉取当前用户的任务列表（含完成状态）。
+//
+// 2026-11-24 实测：/user/tasks 返回 12 条，但网页「任务清单」只显示 9 条
+// —— 网页按公共清单（/servlet/tasks，biz_type=opc）过滤后渲染。
+// 多出的 3 条（innovation_contest_signup / ai_native_daily_case /
+// ai_native_weekly_issue）不在网页清单里，可能是内部/预留任务。
+// 为与网页一致（用户对数就是 9），这里拉回后按公共清单过滤，
+// 但**保留**有独立执行入口的任务（ICT 创新赛在面板有自己的按钮和
+// 探测链路，滤掉会让人以为这个任务不存在）；公共清单拉不到时原样返回
+// （宁可多显示，不能全空）。
 func (s *GrowSession) Tasks() ([]GrowTask, error) {
-	return s.TasksAt(GrowAPIBase)
+	tasks, err := s.TasksAt(GrowAPIBase)
+	if err != nil {
+		return nil, err
+	}
+	pub, perr := s.publicTasks()
+	if perr != nil || len(pub) == 0 {
+		return tasks, nil
+	}
+	allow := make(map[string]bool, len(pub)+1)
+	for _, t := range pub {
+		allow[t.TaskTag] = true
+	}
+	// 不在网页清单、但仍有独立入口的任务白名单。
+	allow[TagICTInnovation] = true
+	filtered := tasks[:0]
+	for _, t := range tasks {
+		if allow[t.TaskTag] {
+			filtered = append(filtered, t)
+		}
+	}
+	return filtered, nil
 }
 
 // TasksAt 同 Tasks，可指定 base（测试用）。
