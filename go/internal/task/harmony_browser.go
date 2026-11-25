@@ -441,6 +441,42 @@ func RunHarmonyStarBrowser(sess *huawei.Session, stateDir string, headless bool)
 		return nil, err
 	}
 
+	if err := browser.EnsureDriver(); err != nil {
+		return nil, err
+	}
+
+	// 浏览器启动与全流程加整体看门狗（8 分钟）。
+	//
+	// 2026-11-25 实测：热情号 GitCode 重登成功后重试 Star，这一段
+	// 18 分钟无任何输出 —— daily 脚本的 timeout 1200 把整个账号杀掉，
+	// 结果该账号被标失败（尽管签到/DevSpace/浏览三项都做完了）。
+	// playwright.Run / NewStorageContext 内部无超时，驱动或浏览器挂起时
+	// 只能靠外部闹钟兜底：到点强制返回错误，让上层记「Star 超时」继续收尾，
+	// 其余已完成的步骤不陪葬。
+	//
+	// goroutine 里跑真实逻辑，主流程 select 等结果或闹钟；
+	// 闹钟触发后函数直接返回，孤儿 goroutine 随进程退出被回收
+	// （pw.Stop 不调用会留浏览器进程，由 hwcloud-clean-browsers.timer 定期清）。
+	type starResult struct {
+		res map[string]any
+		err error
+	}
+	done := make(chan starResult, 1)
+	go func() {
+		res, err := runHarmonyStarBrowserInner(sess, stateDir, headless, cases)
+		done <- starResult{res, err}
+	}()
+	select {
+	case r := <-done:
+		return r.res, r.err
+	case <-time.After(8 * time.Minute):
+		return nil, fmt.Errorf("鸿蒙 Star 浏览器流程 8 分钟未完成（疑似浏览器挂起），跳过本次")
+	}
+}
+
+// runHarmonyStarBrowserInner 是 RunHarmonyStarBrowser 的浏览器实现主体，
+// 拆出来是为了给外层加看门狗。cases 由调用方传入（已在超时保护内完成拉取）。
+func runHarmonyStarBrowserInner(sess *huawei.Session, stateDir string, headless bool, cases []harmonyCase) (map[string]any, error) {
 	// 只保留有 publicRepo 的案例
 	type candidate struct {
 		CaseID   string
@@ -459,9 +495,6 @@ func RunHarmonyStarBrowser(sess *huawei.Session, stateDir string, headless bool)
 		return nil, fmt.Errorf("案例列表里没有可用代码仓")
 	}
 
-	if err := browser.EnsureDriver(); err != nil {
-		return nil, err
-	}
 	pw, err := playwright.Run()
 	if err != nil {
 		return nil, err
@@ -503,18 +536,9 @@ func RunHarmonyStarBrowser(sess *huawei.Session, stateDir string, headless bool)
 
 	// ---------- 遍历候选仓库找未 Star 的 ----------
 	//
-	// 必须设总时长上限。
-	//
-	// 2026-11-14 实测：15730639941 在 09:44 进入这段循环，10:31 才出来，
-	// 卡了 47 分钟 —— 把整个 daily 窗口（systemd TimeoutStartSec=3600）
-	// 耗尽，后面两个账号直接没跑。
-	//
-	// 原因：候选仓库 40+ 个，每个 goto 超时 60s + 等待 6s，最坏 44 分钟。
-	// 网络稍慢或某些仓库一直超时，就会一路试到底。
-	//
-	// 现在加 12 分钟硬上限并缩短单步超时：正常几个仓库就能找到未 Star 的，
-	// 超时就按「待同步」返回（下次再试），不拖垮其它账号。
-	starDeadline := time.Now().Add(12 * time.Minute)
+	// 内层自限 7 分钟：外层看门狗是 8 分钟，内层必须先到期，
+	// 否则永远走不到「返回已试列表」的收尾分支。
+	starDeadline := time.Now().Add(7 * time.Minute)
 	attempts := []map[string]any{}
 	for _, cand := range cands {
 		if time.Now().After(starDeadline) {
@@ -526,7 +550,7 @@ func RunHarmonyStarBrowser(sess *huawei.Session, stateDir string, headless bool)
 				"completed":     false,
 				"pending_check": true,
 				"tried":         attempts,
-				"msg": fmt.Sprintf("遍历 %d 个候选仓库仍未找到可 Star 的（超时 12 分钟），下次再试", len(attempts)),
+				"msg": fmt.Sprintf("遍历 %d 个候选仓库仍未找到可 Star 的（超时 7 分钟），下次再试", len(attempts)),
 			}, nil
 		}
 		repoURL := "https://gitcode.com/" + cand.RepoPath

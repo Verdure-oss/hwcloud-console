@@ -505,17 +505,19 @@ function renderAccount(a){
         act('run', 'daily', '一键日常', 'primary') +
         act('run', 'sign', '签到') +
         act('run', 'devspace', 'DevSpace') +
-        act('run', 'blog', '发文章') +
         act('run', 'harmony-daily', '鸿蒙浏览') +
         act('run', 'harmony-star-run', '鸿蒙Star') +
       '</div>' +
       '<div class="act-group">' +
         '<span class="act-label">周常</span>' +
         act('run', 'weekly', '一键周常', 'primary') +
-        act('run', 'lab', '云实验') +
         act('run', 'issue', '提Issue') +
         act('run', 'star', 'Star仓库') +
-        act('run', 'eventjoin', '活动报名') +
+      '</div>' +
+      '<div class="act-group">' +
+        '<span class="act-label">一次性</span>' +
+        act('run', 'grape', 'Star Grape') +
+        act('run', 'ict', 'ICT创新赛') +
       '</div>' +
       '<div class="act-group">' +
         '<span class="act-label">每月</span>' +
@@ -767,13 +769,12 @@ async function startRelogin(id){
   setTimeout(() => doLogin(), 200);
 }
 
-// queryBeans 查一次实时积分。
+// queryBeans 查一次积分。
 //
-// 为什么不复用列表里的 beans 字段：那个有 60 秒缓存，而且离线时是 -1。
-// 用户点这个按钮就是想要「现在的准确值」，所以走单独的 /run?name=beans。
-//
-// 后端用 withAccountTry，长任务占着锁时会立刻返回 busy ——
-// 这里如实提示「稍后再查」，不假装成功也不让用户干等。
+// 2026-11-23 积分显示改走缓存机制：面板列表上的积分是**缓存值**
+// （做完任务/显式操作时后端自动刷新），点这个按钮是显式操作，
+// 后端现查一次并更新缓存。现查失败时后端回读缓存并标 stale，
+// 这里把「显示的是缓存值」如实告诉用户，不假装是实时值。
 async function queryBeans(id){
   const a = accounts.find(x => x.id === id);
   const label = a ? a.phone : id;
@@ -786,8 +787,12 @@ async function queryBeans(id){
       showMsg('globalMsg', label + ' 积分查询失败: ' + r.error, false);
       return;
     }
-    showMsg('globalMsg', label + ' 当前积分：' + r.beans, true);
-    // 重新拉列表 —— 后端已经把新积分写进 beansCache，这次刷新会显示新值
+    if(r.stale){
+      showMsg('globalMsg', label + ' 现查失败，显示缓存值 ' + r.beans + '（' + r.cached_at + ' 更新）', false);
+    }else{
+      showMsg('globalMsg', label + ' 当前积分：' + r.beans, true);
+    }
+    // 重新拉列表 —— 后端已经把新积分写进持久缓存，这次刷新会显示新值
     loadAccounts();
   }catch(e){
     showMsg('globalMsg', label + ' 积分查询失败: ' + e.message, false);
@@ -1250,8 +1255,9 @@ async function doTrust(){
 // 任务名 → 中文标签。放这里而不是函数后面，避免 const 的 TDZ 问题。
 const TASK_LABELS = {
   daily: '一键日常', weekly: '一键周常', sign: '签到', devspace: 'DevSpace',
-  lab: '云实验', blog: '发文章', issue: '提Issue', star: 'Star', eventjoin: '活动报名', keepalive: '保活',
-  'gallery-publish': '展览馆发布',
+  lab: '云实验', blog: '发文章', issue: '提Issue', star: 'Star', eventjoin: '活动报名',
+  grape: 'Star Grape', ict: 'ICT创新赛',
+  keepalive: '保活', 'gallery-publish': '展览馆发布',
 };
 
 // runningTasks 记录正在执行的任务，防止连点。
@@ -1503,8 +1509,9 @@ async function checkAccount(id){
   }
 }
 
-// 拉取成长中心的完整任务列表（1-5 星全查）。
-// 之前 CLI 默认只查 1,2 星，3/4 星的任务（微认证、发作品、赛事）根本看不到。
+// 拉取成长中心的任务列表。
+// 2026-11-23 新平台按周期（DAILY/WEEKLY/MONTHLY/LIMIT）划分，不再有星级；
+// 后端仍会带回 degree 兼容字段，这里优先显示周期。
 async function showTasks(id){
   showMsg('globalMsg', '正在拉取任务列表…', true);
   try{
@@ -1515,16 +1522,19 @@ async function showTasks(id){
 
     const done = list.filter(t => t.done).length;
     $('tasksTitle').textContent = '成长中心任务（' + done + '/' + list.length + ' 已完成）';
-    const stars = {1:'★', 2:'★★', 3:'★★★', 4:'★★★★', 5:'★★★★★'};
+    const cycleLabel = {DAILY:'每日', WEEKLY:'每周', MONTHLY:'每月', LIMIT:'一次性'};
     $('tasksBody').innerHTML = list.map(t => {
       const mark = t.done
         ? '<span style="color:var(--ok)">已完成</span>'
         : '<span style="color:var(--warn)">未完成</span>';
+      const cyc = cycleLabel[(t.cycle||'').toUpperCase()] || (t.cycle || (t.degree + '星'));
+      const times = (t.limit > 0) ? (' · ' + (t.times||0) + '/' + t.limit) : '';
       return '<div class="task-row">' +
         '<div class="task-title">' + esc(t.title) + '</div>' +
         '<div class="task-meta">' +
-          '<span>' + (stars[t.degree] || t.degree + '星') + '</span>' +
+          '<span>' + esc(cyc) + '</span>' +
           '<span>+' + t.bonus + ' 积分</span>' +
+          '<span>' + times.replace(/^ · /, '') + '</span>' +
           '<span>' + mark + '</span>' +
         '</div>' +
       '</div>';

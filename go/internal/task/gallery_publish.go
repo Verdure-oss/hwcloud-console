@@ -14,6 +14,7 @@ import (
 	"github.com/playwright-community/playwright-go"
 
 	"hwcloud/internal/config"
+	"hwcloud/internal/huawei"
 )
 
 // 作品展览馆发布任务（每月一次，+200 积分）。
@@ -664,17 +665,37 @@ func findDevstationPage(ctx playwright.BrowserContext) playwright.Page {
 //	→ 展览馆 submit-guide → 点「立即生成作品」→ AI DevSpace
 //
 // 每一步都校验落点，任一步失败就返回错误，由调用方决定是否回退。
+//
+// 2026-11-24 改到新版成长中心（grow.developer.huaweicloud.com）：
+// 旧站 developer.huaweicloud.com/grow 的任务中心已显示
+// 「当前平台任务已下线，请前往新平台参与」，卡片根本不存在，
+// 四个账号全部报「未找到入口（页面 1912 字）」。新站实测有该卡片
+// 和可点的「去完成」按钮（GrowNewPageProbe 实证）。
 func navigateFromGrowthCenter(ctx playwright.BrowserContext, page playwright.Page) error {
-	logStep("  从成长中心进入（真实跳转链路）")
+	logStep("  从新版成长中心进入（真实跳转链路）")
 
-	if _, err := page.Goto("https://developer.huaweicloud.com/grow",
+	if _, err := page.Goto(huawei.GrowBase+"/",
 		playwright.PageGotoOptions{
 			WaitUntil: playwright.WaitUntilStateDomcontentloaded,
 			Timeout:   playwright.Float(90000),
 		}); err != nil {
-		return fmt.Errorf("打开成长中心失败: %v", err)
+		return fmt.Errorf("打开新版成长中心失败: %v", err)
 	}
-	page.WaitForTimeout(10000)
+
+	// SPA 渲染慢：轮询等任务卡片出现（最多 ~40 秒），出现即继续。
+	rendered := false
+	for i := 0; i < 7; i++ {
+		page.WaitForTimeout(6000)
+		body, _ := page.Locator("body").InnerText()
+		if strings.Contains(body, "发布作品") {
+			rendered = true
+			break
+		}
+	}
+	if !rendered {
+		body, _ := page.Locator("body").InnerText()
+		return fmt.Errorf("新版成长中心 40 秒内未渲染出任务卡片（页面 %d 字，URL=%s）", len(body), clip(page.URL(), 90))
+	}
 
 	// 1) 找到展览馆任务卡片，点它的「去完成」
 	clicked := false
@@ -712,7 +733,7 @@ func navigateFromGrowthCenter(ctx playwright.BrowserContext, page playwright.Pag
 		page.WaitForTimeout(4000)
 	}
 	if !clicked {
-		// 区分两种原因：会话失效 vs 本月已完成
+		// 区分几种原因：会话失效 vs 本月已完成 vs 卡片改版
 		//
 		// 会话失效时成长中心是空页面（跳登录或被拦），任务卡片自然找不到。
 		// 这种情况必须明确报错让上层重新登录，而不是静默回退去直接开
@@ -723,10 +744,12 @@ func navigateFromGrowthCenter(ctx playwright.BrowserContext, page playwright.Pag
 			len(strings.TrimSpace(body)) < 200 {
 			return fmt.Errorf("华为云会话已失效（成长中心页面为空/跳登录），需要重新登录")
 		}
-		if strings.Contains(body, "已完成") && !strings.Contains(body, "去完成") {
-			return fmt.Errorf("本月「发布作品」任务已完成，无需重复执行")
+		// 本月已完成：卡片上的按钮不再是「去完成」。
+		// 判据以成长中心 API 为准更可靠，这里只兜页面信号。
+		if strings.Contains(body, "发布作品") && !strings.Contains(body, "去完成") {
+			return fmt.Errorf("本月「发布作品」任务已完成（卡片无「去完成」按钮），无需重复执行")
 		}
-		return fmt.Errorf("成长中心未找到「在开发者作品展览馆中发布作品」的入口（页面 %d 字）", len(body))
+		return fmt.Errorf("新版成长中心未找到「在开发者作品展览馆中发布作品」的入口（页面 %d 字，URL=%s）", len(body), clip(u, 90))
 	}
 	page.WaitForTimeout(10000)
 
@@ -828,6 +851,197 @@ func navigateFromGrowthCenter(ctx playwright.BrowserContext, page playwright.Pag
 		}
 	}
 	return fmt.Errorf("点击后未出现 devstation 页面")
+}
+
+// GrowPageProbe 只读诊断：打开成长中心页面，dump 任务卡片情况。
+//
+// 用途：navigateFromGrowthCenter 报「未找到入口」时，光看页面字数
+// 定位不了是改版了、卡片文案变了、还是整页没渲染。这个探针不点任何
+// 按钮，把正文、含「发布作品」的元素文本、所有「去完成」按钮数量
+// 原样带回来，一眼看清页面长什么样。
+func GrowPageProbe() (map[string]any, error) {
+	out := map[string]any{"account": config.AccountID()}
+
+	pw, err := playwright.Run()
+	if err != nil {
+		return out, fmt.Errorf("启动 playwright 失败: %v", err)
+	}
+	defer pw.Stop()
+
+	acct := config.AccountID()
+	profile, port := galleryProfileFor(acct)
+	defer closeGalleryBrowser(port)
+	if err := ensureGalleryBrowser(profile, port); err != nil {
+		return out, err
+	}
+	br, err := pw.Chromium.ConnectOverCDP("http://127.0.0.1:" + port)
+	if err != nil {
+		return out, fmt.Errorf("CDP 连接失败: %v", err)
+	}
+	defer br.Close()
+
+	ctx := br.Contexts()[0]
+	pages := ctx.Pages()
+	for i := len(pages) - 1; i >= 1; i-- {
+		_ = pages[i].Close()
+	}
+	page := pages[0]
+	if _, err := page.Goto("https://developer.huaweicloud.com/grow",
+		playwright.PageGotoOptions{
+			WaitUntil: playwright.WaitUntilStateDomcontentloaded,
+			Timeout:   playwright.Float(90000),
+		}); err != nil {
+		return out, fmt.Errorf("打开成长中心失败: %v", err)
+	}
+	page.WaitForTimeout(12000)
+
+	out["url"] = page.URL()
+	body, _ := page.Locator("body").InnerText()
+	out["body_len"] = len(body)
+	// 页面标题可能整段太长，截前 1500 字
+	r := []rune(body)
+	if len(r) > 1500 {
+		r = r[:1500]
+	}
+	out["body"] = string(r)
+
+	// 任务卡片相关元素
+	info, err := page.Evaluate(`() => {
+		const res = {cards: [], buttons: [], titles: []};
+		// 所有含「发布作品」的元素（取最内层）
+		for (const e of document.querySelectorAll('*')) {
+			const t = (e.innerText||'').trim();
+			if (!t || t.indexOf('发布作品') < 0) continue;
+			let inner = true;
+			for (const c of e.children) {
+				if ((c.innerText||'').indexOf('发布作品') >= 0) { inner = false; break; }
+			}
+			if (inner) res.titles.push(t.slice(0, 120));
+		}
+		// 所有「去完成」按钮
+		for (const b of document.querySelectorAll('button,a,div,span')) {
+			const t = (b.innerText||'').trim();
+			if (t === '去完成' || t === '已完成') {
+				const r = b.getBoundingClientRect();
+				res.buttons.push({text: t, w: Math.round(r.width), h: Math.round(r.height), visible: r.width>0 && r.height>0});
+			}
+		}
+		// 任务区块里的卡片标题
+		for (const e of document.querySelectorAll('[class*=task],[class*=card],[class*=mission]')) {
+			const t = (e.innerText||'').trim();
+			if (t && t.length < 80 && t.indexOf('\n') < 0) res.cards.push(t);
+		}
+		res.cards = [...new Set(res.cards)].slice(0, 40);
+		res.titles = [...new Set(res.titles)].slice(0, 10);
+		return res;
+	}`)
+	if err != nil {
+		out["eval_err"] = err.Error()
+	} else if m, ok := info.(map[string]any); ok {
+		out["titles"] = m["titles"]
+		out["buttons"] = m["buttons"]
+		out["cards"] = m["cards"]
+	}
+	return out, nil
+}
+
+// GrowNewPageProbe 只读诊断：打开**新版**成长中心，dump 任务卡片情况。
+//
+// 2026-11-24：旧站 developer.huaweicloud.com/grow 的任务中心已显示
+// 「当前平台任务已下线，请前往新平台参与」，navigateFromGrowthCenter
+// 在旧站找「在开发者作品展览馆中发布作品」卡片永远找不到。
+// 这个探针看新站 grow.developer.huaweicloud.com 的卡片长什么样，
+// 供改跳转链路前确认入口形态。
+func GrowNewPageProbe() (map[string]any, error) {
+	out := map[string]any{"account": config.AccountID()}
+
+	pw, err := playwright.Run()
+	if err != nil {
+		return out, fmt.Errorf("启动 playwright 失败: %v", err)
+	}
+	defer pw.Stop()
+
+	acct := config.AccountID()
+	profile, port := galleryProfileFor(acct)
+	defer closeGalleryBrowser(port)
+	if err := ensureGalleryBrowser(profile, port); err != nil {
+		return out, err
+	}
+	br, err := pw.Chromium.ConnectOverCDP("http://127.0.0.1:" + port)
+	if err != nil {
+		return out, fmt.Errorf("CDP 连接失败: %v", err)
+	}
+	defer br.Close()
+
+	ctx := br.Contexts()[0]
+	pages := ctx.Pages()
+	for i := len(pages) - 1; i >= 1; i-- {
+		_ = pages[i].Close()
+	}
+	page := pages[0]
+	// 新站是 Vue SPA，cookie 在 .huaweicloud.com 域上应该直接带过去
+	if _, err := page.Goto(huawei.GrowBase+"/",
+		playwright.PageGotoOptions{
+			WaitUntil: playwright.WaitUntilStateDomcontentloaded,
+			Timeout:   playwright.Float(90000),
+		}); err != nil {
+		return out, fmt.Errorf("打开新成长中心失败: %v", err)
+	}
+	// SPA 渲染慢，多等几轮，轮询任务卡片出现
+	for i := 0; i < 5; i++ {
+		page.WaitForTimeout(6000)
+		body, _ := page.Locator("body").InnerText()
+		if strings.Contains(body, "发布作品") || strings.Contains(body, "任务") {
+			out["waited_rounds"] = i + 1
+			break
+		}
+	}
+
+	out["url"] = page.URL()
+	body, _ := page.Locator("body").InnerText()
+	out["body_len"] = len(body)
+	r := []rune(body)
+	if len(r) > 1600 {
+		r = r[:1600]
+	}
+	out["body"] = string(r)
+
+	info, err := page.Evaluate(`() => {
+		const res = {cards: [], buttons: [], titles: []};
+		for (const e of document.querySelectorAll('*')) {
+			const t = (e.innerText||'').trim();
+			if (!t || t.indexOf('发布作品') < 0) continue;
+			let inner = true;
+			for (const c of e.children) {
+				if ((c.innerText||'').indexOf('发布作品') >= 0) { inner = false; break; }
+			}
+			if (inner) res.titles.push(t.slice(0, 160));
+		}
+		for (const b of document.querySelectorAll('button,a,div,span')) {
+			const t = (b.innerText||'').trim();
+			if (t === '去完成' || t === '已完成' || t === '去报名' || t === '立即参与') {
+				const r = b.getBoundingClientRect();
+				res.buttons.push({text: t, w: Math.round(r.width), h: Math.round(r.height), visible: r.width>0 && r.height>0});
+			}
+		}
+		for (const e of document.querySelectorAll('[class*=task],[class*=card],[class*=mission],[class*=item]')) {
+			const t = (e.innerText||'').trim();
+			if (t && t.length < 100 && t.indexOf('\n') >= 0 && (t.indexOf('发布')>=0 || t.indexOf('Star')>=0 || t.indexOf('签到')>=0)) {
+				res.cards.push(t.slice(0, 100));
+			}
+		}
+		res.cards = [...new Set(res.cards)].slice(0, 40);
+		res.titles = [...new Set(res.titles)].slice(0, 10);
+		return res;
+	}`)
+	if err != nil {
+		out["eval_err"] = err.Error()
+	} else if m, ok := info.(map[string]any); ok {
+		out["titles"] = m["titles"]
+		out["buttons"] = m["buttons"]
+		out["cards"] = m["cards"]
+	}
+	return out, nil
 }
 
 // dismissGalleryDialogs 处理 DevSpace 的四道开通/协议弹窗。

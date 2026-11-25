@@ -155,7 +155,37 @@ func HohBind(gitcodeUser string) (map[string]any, error) {
 	return out, nil
 }
 
-// TrackDevSpace 上报「体验 AI DevSpace」行为。
+// HohTaskStatus 返回实践中心的账号绑定事实（GitHub / GitCode 是否已绑定）。
+//
+// 2026-11-23 修正（重要）：这里原来靠正则匹配卡片里的「已完成」文字，
+// 但实测那是**静态模板**，不是真实状态：
+//   - CSS `.task-status { display: none }` 默认全隐藏；
+//   - 前端 renderTask() 明确写 `card.classList.remove('task-done')`，
+//     注释是「始终不限制、不锁定、不计数」。
+// 也就是说页面 HTML 里所有卡片都硬编码着「已完成」，服务端从不渲染状态。
+// 旧实现因此对每个账号都返回 taskGrapeStar=true / taskStar=true /
+// taskIssue=true —— 全假阳性，会让上层把没做的任务当成已完成而跳过。
+//
+// 现在只报**能够证实的**状态：GitHub 绑定态走 /api/github/status，
+// GitCode 绑定态走 /api/binding/status；任务完成与否以成长中心
+// /user/tasks 的 is_finish 为准（由激励服务异步结算）。
+func HohTaskStatus() (map[string]bool, error) {
+	session, err := huawei.New("")
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]bool{}
+	if gh, err := hohGitHubStatus(session); err == nil {
+		out["githubBound"] = gh.HasGitHub
+	}
+	if b, err := hohBindingStatus(session); err == nil {
+		out["gitcodeBound"] = b.GitCodeBound
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("实践中心状态不可用（绑定接口均失败）")
+	}
+	return out, nil
+}
 func TrackDevSpace() (map[string]any, error) {
 	session, err := huawei.New("")
 	if err != nil {

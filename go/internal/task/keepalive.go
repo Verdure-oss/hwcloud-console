@@ -31,6 +31,14 @@ func huaweiSession() (*huawei.Session, error) {
 
 // SessionAlive 用 HTTP 快速判断当前 cookie 是否还有效。
 func SessionAlive() (bool, error) {
+	// 2026-11-23：新版成长中心是唯一权威探活源。
+	// 旧 devdata 的 CheckLogin 已下线，继续用它会让每个在线账号
+	// 都被判成「过期」，于是每次 CLI 调用都白开一次浏览器登录。
+	if gs, err := huawei.NewGrowSession(); err == nil {
+		if _, uerr := gs.UserInfo(); uerr == nil {
+			return true, nil
+		}
+	}
 	sess, err := huaweiSession()
 	if err != nil {
 		return false, err
@@ -474,6 +482,31 @@ var cookieHosts = []string{
 
 // SessionInfo 返回当前会话的剩余信息。
 func SessionInfo() (map[string]any, error) {
+	// 2026-11-23：新版成长中心已是主站，先按新站探活。
+	// 旧 devdata 接口已下线（403 not login / 404），huawei.New 的
+	// CheckLogin 只会把在线账号误判成离线，进而触发不必要的账密重登。
+	if gs, gerr := huawei.NewGrowSession(); gerr == nil {
+		if u, uerr := gs.UserInfo(); uerr == nil {
+			out := map[string]any{
+				"alive":    true,
+				"username": u.DomainName,
+				"points":   u.TotalPoints,
+				"backend":  "grow-new",
+			}
+			// /user/info 没有 signed 字段，签到状态取任务清单里的 daily_login。
+			if signed, serr := gs.SignedToday(); serr == nil {
+				out["signed"] = signed
+			}
+			if t, name, ok := authExpiry(); ok {
+				out["auth_expiry"] = t.Format("2006-01-02 15:04:05")
+				out["auth_cookie"] = name
+				out["auth_remaining_hours"] = time.Until(t).Hours()
+				out["auth_remaining_days"] = time.Until(t).Hours() / 24
+			}
+			return out, nil
+		}
+	}
+	// 新站不可用时退回旧逻辑，保持兼容。
 	sess, err := huaweiSession()
 	if err != nil {
 		return nil, err
@@ -536,6 +569,29 @@ func SessionInfo() (map[string]any, error) {
 // 这个版本直接接收账号 state 目录，不碰任何全局状态，可以并发调用。
 // dir 形如 /opt/hwcloud-demo/accounts/<phone>/state。
 func SessionInfoFor(dir string) (map[string]any, error) {
+	// 2026-11-23：与 SessionInfo 一致，先按新版成长中心探活。
+	// 旧 devdata 的 CheckLogin 已下线，会把在线账号误判成离线。
+	if gs, gerr := huawei.NewGrowSessionForAccount(dir); gerr == nil {
+		if u, uerr := gs.UserInfo(); uerr == nil {
+			out := map[string]any{
+				"alive":    true,
+				"username": u.DomainName,
+				"points":   u.TotalPoints,
+				"backend":  "grow-new",
+			}
+			if signed, serr := gs.SignedToday(); serr == nil {
+				out["signed"] = signed
+			}
+			if t, name, ok := authExpiryIn(filepath.Join(dir, "cookies.json")); ok {
+				out["auth_expiry"] = t.Format("2006-01-02 15:04:05")
+				out["auth_cookie"] = name
+				out["auth_remaining_hours"] = time.Until(t).Hours()
+				out["auth_remaining_days"] = time.Until(t).Hours() / 24
+			}
+			return out, nil
+		}
+	}
+
 	sess, err := huawei.NewForAccount(dir)
 	if err != nil {
 		return nil, err

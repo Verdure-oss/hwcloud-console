@@ -447,20 +447,37 @@ func gitcodeCall(cookie, path, method string, body any) (int, []byte, error) {
 }
 
 // listGitcodeRepos 列组织的仓库。
+//
+// GitCode 对公共机器人账号（p_repoRobot）有全平台共享的小时限流
+// （10 万次/小时，2026-11-25 实测撞上）：高峰期 429 是**瞬时**的，
+// 隔 20 秒重试就能过。这里带 3 次退避重试，避免整步直接失败。
 func listGitcodeRepos(cookie, org string) ([]gitcodeRepo, error) {
-	st, raw, err := gitcodeCall(cookie,
-		"/api/v5/orgs/"+org+"/repos?page=1&per_page=100", http.MethodGet, nil)
-	if err != nil {
-		return nil, err
+	var lastErr error
+	backoff := []time.Duration{0, 20 * time.Second, 45 * time.Second}
+	for _, wait := range backoff {
+		if wait > 0 {
+			time.Sleep(wait)
+		}
+		st, raw, err := gitcodeCall(cookie,
+			"/api/v5/orgs/"+org+"/repos?page=1&per_page=100", http.MethodGet, nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if st == http.StatusTooManyRequests {
+			lastErr = fmt.Errorf("仓库列表 HTTP %d: %s", st, harmonyClip(string(raw)))
+			continue
+		}
+		if st != http.StatusOK {
+			return nil, fmt.Errorf("仓库列表 HTTP %d: %s", st, harmonyClip(string(raw)))
+		}
+		var repos []gitcodeRepo
+		if err := json.Unmarshal(raw, &repos); err != nil {
+			return nil, fmt.Errorf("解析仓库列表失败: %v", err)
+		}
+		return repos, nil
 	}
-	if st != http.StatusOK {
-		return nil, fmt.Errorf("仓库列表 HTTP %d: %s", st, harmonyClip(string(raw)))
-	}
-	var repos []gitcodeRepo
-	if err := json.Unmarshal(raw, &repos); err != nil {
-		return nil, fmt.Errorf("解析仓库列表失败: %v", err)
-	}
-	return repos, nil
+	return nil, lastErr
 }
 
 // RunHarmonyStar 完成「Star 鸿蒙开发实践中心案例仓」(+30)。

@@ -80,20 +80,11 @@ func loadPushPlusConfig() *pushPlusConfig {
 	if err != nil {
 		return cfg
 	}
-	var onDisk pushPlusConfig
-	if err := json.Unmarshal(raw, &onDisk); err != nil {
-		return cfg
+	// Unmarshal onto defaults preserves missing fields and explicit false values.
+	if err := json.Unmarshal(raw, cfg); err != nil {
+		return defaultPushPlusConfig()
 	}
-	// 字段级合并：老版本文件缺 events 时保留默认 true，
-	// 而不是因为缺字段就全变 false。
-	if onDisk.Token != "" || onDisk.Enabled {
-		cfg.Token = onDisk.Token
-		cfg.Enabled = onDisk.Enabled
-		cfg.Topic = onDisk.Topic
-		if onDisk.Events != (pushPlusEvents{}) {
-			cfg.Events = onDisk.Events
-		}
-	}
+
 	return cfg
 }
 
@@ -183,17 +174,27 @@ func sendPushPlus(token, title, content, topic string) error {
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("请求 pushplus 失败: %w", err)
+		return fmt.Errorf("请求 pushplus 失败（网络或超时）")
 	}
 	defer resp.Body.Close()
 
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	var pr PushPlusResponse
 	if err := json.Unmarshal(raw, &pr); err != nil {
-		return fmt.Errorf("pushplus 响应解析失败（HTTP %d）: %s", resp.StatusCode, clipStr(string(raw), 120))
+		return fmt.Errorf("pushplus 响应解析失败（HTTP %d）", resp.StatusCode)
 	}
-	if pr.Code != 200 {
-		return fmt.Errorf("pushplus 返回错误 code=%d msg=%s", pr.Code, pr.Msg)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 || pr.Code != 200 {
+		return fmt.Errorf("pushplus 返回错误 HTTP=%d code=%d", resp.StatusCode, pr.Code)
+	}
+	// Only log a strict ID alphabet; never echo platform text or token.
+	safeID := pr.Data != "" && len(pr.Data) <= 128 && !strings.Contains(pr.Data, token)
+	for _, c := range pr.Data {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+			safeID = false
+		}
+	}
+	if safeID {
+		svcLog("[pushplus] 平台已接受 message_id=%s", pr.Data)
 	}
 	return nil
 }
@@ -224,7 +225,7 @@ func (s *Server) notify(event, title, content string) {
 		svcLog("[pushplus] 推送失败（%s）：%v", event, err)
 		return
 	}
-	svcLog("[pushplus] 已推送（%s）：%s", event, title)
+	svcLog("[pushplus] 平台已接受（%s）：%s", event, title)
 }
 
 // ---- HTTP handlers ----
@@ -236,9 +237,9 @@ func (s *Server) notify(event, title, content string) {
 func (s *Server) handlePushPlusGet(w http.ResponseWriter, r *http.Request) {
 	cfg := currentPushConfig()
 	out := map[string]any{
-		"enabled": cfg.Enabled,
-		"topic":   cfg.Topic,
-		"events":  cfg.Events,
+		"enabled":   cfg.Enabled,
+		"topic":     cfg.Topic,
+		"events":    cfg.Events,
 		"has_token": strings.TrimSpace(cfg.Token) != "",
 	}
 	if cfg.Token != "" {

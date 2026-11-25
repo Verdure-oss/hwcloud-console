@@ -102,15 +102,50 @@ func RunCloudPractice(headless bool) (map[string]any, error) {
 
 	// 等环境就绪。
 	// 判据：「环境准备中」消失，且出现「剩余核时」或「当前环境运行中」。
-	// 实测创建容器约 30~60 秒。
+	//
+	// 2026-11-23 实测（周常真实失败原因）：
+	//   环境其实在正常创建，但 DevSpace 弹出了「版本有更新，建议升级」对话框，
+	//   正文是「环境准备中，请勿关闭窗口...」+ 升级弹窗的「确认/取消」。
+	//   这个弹窗不处理会一直盖住页面，等待循环只能看到「环境准备中」，
+	//   最后误报成「环境 12 分钟未就绪」。
+	//   所以每轮先尝试关掉「取消」/「稍后」/「关闭」，再判断状态。
 	ready := false
-	deadline := time.Now().Add(6 * time.Minute)
+	deadline := time.Now().Add(12 * time.Minute)
+	lastText := ""
+	dismissedUpgrade := false
 	for time.Now().Before(deadline) {
 		page.WaitForTimeout(6000)
+		// 处理升级弹窗：点「取消」比点「确认」安全（不在任务里触发版本升级）。
+		if !dismissedUpgrade {
+			for _, label := range []string{"取消", "稍后", "以后再说", "关闭"} {
+				for _, sel := range []string{
+					`[class*="dialog"] button:has-text("%s")`,
+					`[class*="modal"] button:has-text("%s")`,
+					`button:has-text("%s")`,
+				} {
+					loc := page.Locator(fmt.Sprintf(sel, label))
+					if n, _ := loc.Count(); n == 0 {
+						continue
+					}
+					if vis, _ := loc.First().IsVisible(); !vis {
+						continue
+					}
+					if err := loc.First().Click(playwright.LocatorClickOptions{Timeout: playwright.Float(4000)}); err == nil {
+						dismissedUpgrade = true
+						time.Sleep(2 * time.Second)
+						break
+					}
+				}
+				if dismissedUpgrade {
+					break
+				}
+			}
+		}
 		b, err := page.Locator("body").InnerText()
 		if err != nil {
 			continue
 		}
+		lastText = b
 		if strings.Contains(b, "环境准备中") {
 			continue
 		}
@@ -125,14 +160,28 @@ func RunCloudPractice(headless bool) (map[string]any, error) {
 		page.WaitForTimeout(20000)
 	}
 
-	msg := "环境未在 6 分钟内就绪"
+	msg := "环境未在 12 分钟内就绪（DevSpace 侧较慢，可稍后重试）"
 	if ready {
 		msg = "环境已就绪，云端实践已触发"
 	}
-	return map[string]any{
-		"ok":        ready,
-		"agreed":    agreed,
-		"env_ready": ready,
-		"msg":       msg,
-	}, nil
+	out := map[string]any{
+		"ok":               ready,
+		"agreed":           agreed,
+		"env_ready":        ready,
+		"dismissed_upgrade": dismissedUpgrade,
+		"msg":              msg,
+	}
+	if !ready && lastText != "" {
+		out["page_hint"] = clipRunes(lastText, 300)
+	}
+	return out, nil
+}
+
+// clipRunes 按 rune 截断，避免中文被截成半个字。
+func clipRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }
