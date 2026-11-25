@@ -304,8 +304,18 @@ func hashPassword(username, pw string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// cookieOpts 返回面板会话 cookie 的属性。
+//
+// 为什么必须是 SameSite=None + Secure（2026-11-25 实测）：
+//   noVNC 的 WebSocket 端点 /websockify 也走面板鉴权（guard），
+//   而浏览器发起 WebSocket 属于子资源请求。SameSite=Lax 时
+//   这类请求不带 Cookie，于是握手被 401 拒绝 ——
+//   表现就是 /vnc/ 页面能打开但画面全黑，且页面上看不到任何报错。
+//   实测：不带 Cookie → 401，带 Cookie → 101 Switching Protocols。
+//   改成 SameSite=None 后跨站子资源也会带上，但规范要求同时设 Secure，
+//   因此面板必须通过 HTTPS 访问（当前部署已是 HTTPS）。
 func cookieOpts() (name string, maxAge int, httpOnly, secure bool, path string, sameSite http.SameSite) {
-	return cookieName, int(tokenTTL.Seconds()), true, false, "/", http.SameSiteLaxMode
+	return cookieName, int(tokenTTL.Seconds()), true, true, "/", http.SameSiteNoneMode
 }
 
 func clientIP(r *http.Request) string {
