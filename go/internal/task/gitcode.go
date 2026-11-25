@@ -215,33 +215,90 @@ func CreateIssue(title, body, template string, headless, dryRun bool) (map[strin
 	// 「使用该模板」这串文字同时出现在外层 DIV 和内层 STRONG 上，GetByText
 	// 会命中 DIV —— 点它不触发任何事件，页面原地不动，最后报「未进入
 	// Issue 编辑页」，看起来像会话失效，实际是点错了元素。
-	if strings.Contains(page.URL(), "choose") {
-		index := 1
-		if template == "bug" {
-			index = 0
+	// ISSUE_TEMPLATE_FIX
+	//
+	// 2026-11-25 实测失败：页面停在 /issues/create/choose，
+	// 按钮列表里明明有 [Use this template] ×2，日志却报「找不到 Issue 提交按钮」。
+	// 根因不是找不到模板按钮，而是点了之后没进编辑器，后面一路往下走到
+	// 「找提交按钮」才报错，把真实原因盖住了。
+	//
+	// 现在：
+	//   1. 模板按钮逐个尝试（索引可能因模板顺序变化而错位）
+	//   2. 每次点击后确认是否真的进了编辑器
+	//   3. 全都失败时，报「点了模板但没进编辑器」，而不是误导性的「找不到提交按钮」
+	entryReady := func() bool {
+		if count(page.Locator(`input[placeholder*="标题"], input[placeholder*="title" i]`)) > 0 {
+			return true
 		}
+		// 有些版本编辑器用 contenteditable 而不带 placeholder
+		if count(page.Locator(`.cm-content`)) > 0 {
+			return true
+		}
+		return false
+	}
+
+	if strings.Contains(page.URL(), "choose") {
+		// 先收集候选按钮：中文优先，英文兜底
 		buttons := page.Locator(`button:has-text("使用该模板")`)
+		if count(buttons) == 0 {
+			buttons = page.Locator(`button:has-text("Use this template")`)
+		}
 		n := count(buttons)
 		if n == 0 {
-			// 语言/改版兜底
-			buttons = page.Locator(`button:has-text("Use this template")`)
+			// 有些模板卡片是可点的 div/a，不只 button
+			buttons = page.Locator(`:is(button,a,div):has-text("Use this template")`)
 			n = count(buttons)
 		}
 		if n == 0 {
-			return nil, fmt.Errorf("模板选择页没有「使用该模板」按钮（页面可能改版）")
+			return nil, fmt.Errorf("模板选择页没有「使用该模板/Use this template」按钮（页面可能改版）")
 		}
-		if index >= n {
-			index = 0
+
+		prefer := 1
+		if template == "bug" {
+			prefer = 0
 		}
-		if err := buttons.Nth(index).Click(); err != nil {
-			return nil, err
+		// 顺序：偏好索引 → 其余全部，逐个试到进编辑器为止
+		order := []int{}
+		if prefer < n {
+			order = append(order, prefer)
 		}
-		// 点完还要等编辑器渲染
-		for i := 0; i < 20; i++ {
-			if count(page.Locator(`input[placeholder*="标题"], input[placeholder*="title" i]`)) > 0 {
+		for i := 0; i < n; i++ {
+			if i != prefer {
+				order = append(order, i)
+			}
+		}
+
+		entered := false
+		var lastErr error
+		for _, idx := range order {
+			// 强制点击：模板卡片常被遮罩层盖住，普通 click 会超时
+			if err := buttons.Nth(idx).Click(playwright.LocatorClickOptions{
+				Timeout: playwright.Float(8000),
+				Force:   playwright.Bool(true),
+			}); err != nil {
+				lastErr = err
+				continue
+			}
+			// 等编辑器渲染，最多 25 秒
+			for i := 0; i < 25; i++ {
+				if entryReady() {
+					entered = true
+					break
+				}
+				page.WaitForTimeout(1000)
+			}
+			if entered {
 				break
 			}
-			page.WaitForTimeout(1000)
+			lastErr = fmt.Errorf("点了第 %d 个模板按钮但未进入编辑器", idx)
+		}
+
+		if !entered {
+			cur := page.URL()
+			if lastErr != nil {
+				return nil, fmt.Errorf("点模板后未进入 Issue 编辑器（当前 %s）：%v", cur, lastErr)
+			}
+			return nil, fmt.Errorf("点模板后未进入 Issue 编辑器（当前 %s）", cur)
 		}
 	}
 
