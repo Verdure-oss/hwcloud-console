@@ -206,6 +206,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/accounts/autokeepalive", guard(s.handleAccountAutoKeepAlive))
 	mux.HandleFunc("/api/accounts/check", guard(s.handleCheckAccount))
 	mux.HandleFunc("/api/accounts/login", guard(s.handleAccountLogin))
+	mux.HandleFunc("/api/accounts/manual-login", guard(s.handleAccountManualLogin))
 	mux.HandleFunc("/api/accounts/captcha", guard(s.handleCaptcha))
 	mux.HandleFunc("/api/accounts/captcha/image", guard(s.handleCaptchaImage))
 	mux.HandleFunc("/api/accounts/captcha/submit", guard(s.handleCaptchaSubmit))
@@ -933,6 +934,87 @@ type loginReq struct {
 	Password string `json:"password"`
 	Code     string `json:"code"`
 	Action   string `json:"action"`
+}
+
+// handleAccountManualLogin 纯手动登录：服务端只打开登录页，之后全交用户在 VNC 操作。
+//
+// 为什么需要它（2026-11-19 起）：
+//   自动账密登录（handleAccountLogin 的 login 分支）会自己填账号密码、
+//   点登录，第 3 秒就判定验证类型然后自顾自往下走（点「获取验证码」、
+//   CAS 换票）。用户在 VNC 里拖滑块时，脚本早跳到别的页面，
+//   两边抢同一个浏览器，必然失败。手动模式什么都不做，只把页面打开。
+//
+// 这是同步长请求（服务端最长等约 30 分钟）。前端点完应立刻展示 VNC 入口
+// 并提示「等待中」。Nginx 侧已把 proxy_read_timeout 放宽到 2100s。
+func (s *Server) handleAccountManualLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	var req loginReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+
+	acc, ok := s.store.Get(req.ID)
+	if !ok {
+		writeJSON(w, map[string]any{"error": "账号不存在"})
+		return
+	}
+	phone := req.Phone
+	if phone == "" || strings.Contains(phone, "*") {
+		phone = acc.Phone
+	}
+
+	// 串行化：同一时刻只允许一个登录流程，避免开两个浏览器互相干扰
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+
+	svcLog("[manual] %s 打开手动登录页（请到 /vnc/ 操作）", req.ID)
+	start := time.Now()
+	res, err := task.CamoufoxLoginManual(phone)
+	elapsed := time.Since(start).Round(time.Second)
+
+	if err != nil && (res == nil || res.Stage == "") {
+		svcLog("[manual] %s 失败（%s）：%v", req.ID, elapsed, err)
+		writeJSON(w, map[string]any{"error": err.Error(), "elapsed": elapsed.String()})
+		return
+	}
+	if res == nil {
+		writeJSON(w, map[string]any{"error": "登录服务未返回结果"})
+		return
+	}
+
+	if res.Stage == "done" {
+		_ = s.store.Update(req.ID, func(a *account.Account) {
+			a.LastError = ""
+			a.Alive = true
+			a.Trusted = res.Trusted
+			if v, ok := res.Meta["login_at"].(string); ok && v != "" {
+				a.LastCheck = v
+			}
+		})
+		_ = os.Remove(filepath.Join(config.Root(), "state", "NEED_MANUAL_LOGIN"))
+		svcLog("[manual] %s 登录成功（%s）", req.ID, elapsed)
+	} else {
+		msg := res.Error
+		if msg == "" {
+			msg = "登录未完成（stage=" + res.Stage + "）"
+		}
+		_ = s.store.Update(req.ID, func(a *account.Account) {
+			a.LastError = "手动登录: " + msg
+		})
+		svcLog("[manual] %s 未完成（%s）：%s", req.ID, elapsed, msg)
+	}
+
+	writeJSON(w, map[string]any{
+		"ok":      res.Stage == "done",
+		"stage":   res.Stage,
+		"trusted": res.Trusted,
+		"elapsed": elapsed.String(),
+		"error":   res.Error,
+	})
 }
 
 // handleAccountLogin 处理登录相关动作。
